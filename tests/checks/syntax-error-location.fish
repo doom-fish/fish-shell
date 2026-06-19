@@ -50,7 +50,7 @@ $fish -c "set -g fish_function_path $(string escape $TMPDIR); this_should_be_an_
 # CHECKERR: function this_should_be_an_error
 # CHECKERR: ^~~~~~~^
 # CHECKERR: from sourcing file ~/temp/this_should_be_an_error.fish
-# CHECKERR: source: Error while reading file '{{.*}}/this_should_be_an_error.fish'
+# CHECKERR: source: Error while reading file '{{.*}}this_should_be_an_error.fish'
 # CHECKERR: fish: Unknown command: this_should_be_an_error
 # CHECKERR: fish:
 # CHECKERR: set -g fish_function_path {{.*}}; this_should_be_an_error

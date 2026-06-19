@@ -1,4 +1,9 @@
-use std::{os::fd::RawFd, sync::LazyLock};
+use std::sync::LazyLock;
+
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use osfd_win::RawFd;
 
 #[cfg(apple)]
 mod notifyd;
@@ -8,6 +13,9 @@ mod inotify;
 
 #[cfg(bsd)]
 mod kqueue;
+
+#[cfg(windows)]
+mod windows;
 
 #[cfg(all(test, any(apple, any(target_os = "android", target_os = "linux"), bsd)))]
 mod test_helpers;
@@ -62,6 +70,10 @@ pub fn create_notifier() -> Box<dyn UniversalNotifier> {
     }
     #[cfg(bsd)]
     if let Some(notifier) = kqueue::KqueueNotifier::new() {
+        return Box::new(notifier);
+    }
+    #[cfg(windows)]
+    if let Some(notifier) = windows::WindowsNotifier::new() {
         return Box::new(notifier);
     }
     Box::new(NullNotifier)

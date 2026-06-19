@@ -7,7 +7,7 @@
 # Do not replace empties in MANPATH - see #4158.
 
 echo "$PATH"
-# CHECK: /usr/bin:a:.:b
+# CHECK: {{(/usr/bin|/c/.*/usr/bin)}}:a:.:b
 
 echo "$CDPATH"
 # CHECK: d:.:e

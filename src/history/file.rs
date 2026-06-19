@@ -15,9 +15,12 @@ use std::{
     fs::File,
     io::Read as _,
     ops::{Deref, DerefMut},
-    os::fd::AsRawFd as _,
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(unix)]
+use std::os::fd::AsRawFd as _;
+#[cfg(windows)]
+use osfd_win::AsRawFd as _;
 
 /// History file types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

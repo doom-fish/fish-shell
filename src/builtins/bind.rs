@@ -74,6 +74,24 @@ impl BuiltinBind {
     }
 
     /// Returns a WString for the output line of a bind
+    /// Map a canonicalized special-key codepoint back to the raw control/ASCII
+    /// character it was derived from (e.g. SPACE -> ' ', TAB -> '\t'). This is
+    /// needed when rendering a `RawEscapeSequence` binding: those special-key
+    /// codepoints live in the reserved private-use range, which the tokenizer
+    /// rejects, so emitting them raw (e.g. `\uF50E`) would produce a binding
+    /// that cannot be re-parsed. Returns the codepoint unchanged when it has no
+    /// raw equivalent.
+    fn raw_escape_codepoint(codepoint: char) -> char {
+        match codepoint {
+            key::ENTER => '\r',
+            key::TAB => '\t',
+            key::SPACE => ' ',
+            key::ESCAPE => '\x1b',
+            key::DELETE => '\x7f',
+            other => other,
+        }
+    }
+
     fn generate_output_string(seq: &[Key], user: bool, bind: &Binding) -> WString {
         let mut out = WString::new();
 
@@ -114,16 +132,19 @@ impl BuiltinBind {
                     if key.modifiers == Modifiers::ALT {
                         out.push_utfstr(&char_to_symbol('\x1b', i == 0));
                         out.push_utfstr(&char_to_symbol(
-                            if key.codepoint == key::ESCAPE {
+                            Self::raw_escape_codepoint(if key.codepoint == key::ESCAPE {
                                 '\x1b'
                             } else {
                                 key.codepoint
-                            },
+                            }),
                             false,
                         ));
                     } else {
                         assert!(key.modifiers.is_none());
-                        out.push_utfstr(&char_to_symbol(key.codepoint, i == 0));
+                        out.push_utfstr(&char_to_symbol(
+                            Self::raw_escape_codepoint(key.codepoint),
+                            i == 0,
+                        ));
                     }
                 }
             }

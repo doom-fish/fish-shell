@@ -10,15 +10,25 @@ pub(crate) static LOCALE_LOCK: Mutex<()> = Mutex::new(());
 /// above mutex.
 pub unsafe fn set_libc_locales(log_ok: bool) -> bool {
     let mut ok = true;
-    let from_environment = c"";
-    let mut set = |category_name, category, value| {
-        let locale_string = setlocale(category, Some(value));
+    let mut set = |category_name, category, candidates: &[std::ffi::CString]| {
+        // Try each candidate spelling in turn; the first one the CRT accepts
+        // wins. On glibc the single candidate is the empty string, which means
+        // "use the POSIX environment".
+        let mut locale_string = None;
+        let mut chosen: Option<&std::ffi::CString> = None;
+        for cand in candidates {
+            if let Some(loc) = setlocale(category, Some(cand)) {
+                locale_string = Some(loc);
+                chosen = Some(cand);
+                break;
+            }
+        }
         if log_ok {
             crate::flog::flog!(env_locale, {
-                let source = if value == from_environment {
-                    "from environment".to_owned()
-                } else {
-                    format!("to '{}'", value.to_str().unwrap())
+                let source = match chosen {
+                    Some(c) if c.as_bytes().is_empty() => "from environment".to_owned(),
+                    Some(c) => format!("to '{}'", c.to_string_lossy()),
+                    None => "from environment".to_owned(),
                 };
                 match locale_string {
                     Some(locale_string) => {
@@ -36,12 +46,208 @@ pub unsafe fn set_libc_locales(log_ok: bool) -> bool {
         ok &= locale_string.is_some();
     };
     // For strerror(3p) and strsignal(3p)
-    set("LC_MESSAGES", libc::LC_MESSAGES, from_environment);
+    set("LC_MESSAGES", libc::LC_MESSAGES, &locale_candidates("LC_MESSAGES"));
     // For builtin printf
-    set("LC_NUMERIC", libc::LC_NUMERIC, from_environment);
+    set("LC_NUMERIC", libc::LC_NUMERIC, &locale_candidates("LC_NUMERIC"));
     // For "history --show-time"
-    set("LC_TIME", libc::LC_TIME, from_environment);
+    set("LC_TIME", libc::LC_TIME, &locale_candidates("LC_TIME"));
     ok
+}
+
+/// Resolve the ordered list of locale strings to try with libc `setlocale` for
+/// `category`.
+///
+/// On glibc, `setlocale(cat, "")` consults the POSIX environment variables
+/// (`LC_ALL`, then the specific category, then `LANG`). The Windows CRT does
+/// *not*: `setlocale(cat, "")` ignores those variables and instead selects the
+/// user's default system locale, which on a non-US install yields a comma
+/// decimal separator and breaks `printf`/`strerror` output. Worse, the mingw
+/// msvcrt does not accept BCP-47 (`de-DE`) or POSIX (`de_DE`) names at all — it
+/// only understands Windows names like `German_Germany` (or the language alone,
+/// `German`). So on Windows we emulate the POSIX precedence ourselves and
+/// produce a list of candidate spellings, most specific first. The
+/// empty/`C`/`POSIX` cases (which the test harness sets via `LANG=C`) map to the
+/// CRT's `"C"` locale.
+#[cfg(windows)]
+fn locale_candidates(category: &str) -> Vec<std::ffi::CString> {
+    use std::ffi::CString;
+    let lookup = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let value = lookup("LC_ALL")
+        .or_else(|| lookup(category))
+        .or_else(|| lookup("LANG"));
+    let c_locale = || CString::new("C").unwrap();
+    let value = match value {
+        // No POSIX locale variables set, or an explicit C/POSIX locale: use the
+        // CRT "C" locale, which guarantees '.' as the decimal separator.
+        None => return vec![c_locale()],
+        Some(v) if v == "C" || v == "POSIX" || v.starts_with("C.") || v.starts_with("POSIX.") => {
+            return vec![c_locale()];
+        }
+        Some(v) => v,
+    };
+
+    // Strip any ".codeset" / "@modifier" suffix, e.g. "de_DE.UTF-8" -> "de_DE".
+    let base = value.split(['.', '@']).next().unwrap_or(&value);
+    let mut parts = base.split(['_', '-']);
+    let lang = parts.next().unwrap_or("").to_ascii_lowercase();
+    let country = parts.next().unwrap_or("").to_ascii_uppercase();
+
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |s: String| {
+        if !s.is_empty() && !candidates.contains(&s) {
+            candidates.push(s);
+        }
+    };
+
+    // Most specific: the Windows "Language_Country" spelling.
+    if let Some(win_lang) = windows_language(&lang) {
+        if let Some(win_country) = windows_country(&country) {
+            push(format!("{win_lang}_{win_country}"));
+        }
+        // Language alone (the CRT picks that language's default country).
+        push(win_lang.to_owned());
+    }
+    // BCP-47 "ll-CC" / "ll" — accepted by the Universal CRT toolchains.
+    if !country.is_empty() {
+        push(format!("{lang}-{country}"));
+    }
+    push(lang.clone());
+    // Finally the raw POSIX base and the original value, just in case.
+    push(base.replace('_', "-"));
+    push(base.to_owned());
+    push(value.clone());
+
+    candidates
+        .into_iter()
+        .filter_map(|s| CString::new(s).ok())
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn locale_candidates(_category: &str) -> Vec<std::ffi::CString> {
+    // glibc's setlocale(cat, "") already honours the POSIX environment.
+    vec![std::ffi::CString::default()]
+}
+
+/// Map an ISO 639-1 language code to the Windows/msvcrt English language name.
+#[cfg(windows)]
+fn windows_language(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "af" => "Afrikaans",
+        "sq" => "Albanian",
+        "ar" => "Arabic",
+        "hy" => "Armenian",
+        "eu" => "Basque",
+        "be" => "Belarusian",
+        "bg" => "Bulgarian",
+        "ca" => "Catalan",
+        "zh" => "Chinese",
+        "hr" => "Croatian",
+        "cs" => "Czech",
+        "da" => "Danish",
+        "nl" => "Dutch",
+        "en" => "English",
+        "et" => "Estonian",
+        "fo" => "Faroese",
+        "fa" => "Persian",
+        "fi" => "Finnish",
+        "fr" => "French",
+        "gl" => "Galician",
+        "ka" => "Georgian",
+        "de" => "German",
+        "el" => "Greek",
+        "he" => "Hebrew",
+        "hi" => "Hindi",
+        "hu" => "Hungarian",
+        "is" => "Icelandic",
+        "id" => "Indonesian",
+        "it" => "Italian",
+        "ja" => "Japanese",
+        "kk" => "Kazakh",
+        "ko" => "Korean",
+        "lv" => "Latvian",
+        "lt" => "Lithuanian",
+        "mk" => "Macedonian",
+        "ms" => "Malay",
+        "mt" => "Maltese",
+        "nb" | "nn" | "no" => "Norwegian",
+        "pl" => "Polish",
+        "pt" => "Portuguese",
+        "ro" => "Romanian",
+        "ru" => "Russian",
+        "sr" => "Serbian",
+        "sk" => "Slovak",
+        "sl" => "Slovenian",
+        "es" => "Spanish",
+        "sv" => "Swedish",
+        "th" => "Thai",
+        "tr" => "Turkish",
+        "uk" => "Ukrainian",
+        "vi" => "Vietnamese",
+        _ => return None,
+    })
+}
+
+/// Map an ISO 3166-1 alpha-2 country code to the Windows/msvcrt English country
+/// name.
+#[cfg(windows)]
+fn windows_country(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "AR" => "Argentina",
+        "AT" => "Austria",
+        "AU" => "Australia",
+        "BE" => "Belgium",
+        "BG" => "Bulgaria",
+        "BR" => "Brazil",
+        "BY" => "Belarus",
+        "CA" => "Canada",
+        "CH" => "Switzerland",
+        "CL" => "Chile",
+        "CN" => "China",
+        "CO" => "Colombia",
+        "CZ" => "Czech Republic",
+        "DE" => "Germany",
+        "DK" => "Denmark",
+        "EE" => "Estonia",
+        "ES" => "Spain",
+        "FI" => "Finland",
+        "FR" => "France",
+        "GB" => "United Kingdom",
+        "GR" => "Greece",
+        "HR" => "Croatia",
+        "HU" => "Hungary",
+        "ID" => "Indonesia",
+        "IE" => "Ireland",
+        "IL" => "Israel",
+        "IN" => "India",
+        "IS" => "Iceland",
+        "IT" => "Italy",
+        "JP" => "Japan",
+        "KR" => "Korea",
+        "KZ" => "Kazakhstan",
+        "LT" => "Lithuania",
+        "LV" => "Latvia",
+        "MX" => "Mexico",
+        "MY" => "Malaysia",
+        "NL" => "Netherlands",
+        "NO" => "Norway",
+        "NZ" => "New Zealand",
+        "PL" => "Poland",
+        "PT" => "Portugal",
+        "RO" => "Romania",
+        "RU" => "Russia",
+        "SE" => "Sweden",
+        "SI" => "Slovenia",
+        "SK" => "Slovakia",
+        "TH" => "Thailand",
+        "TR" => "Turkey",
+        "TW" => "Taiwan",
+        "UA" => "Ukraine",
+        "US" => "United States",
+        "VN" => "Vietnam",
+        "ZA" => "South Africa",
+        _ => return None,
+    })
 }
 
 fn setlocale(category: libc::c_int, locale: Option<&CStr>) -> Option<&'static CStr> {

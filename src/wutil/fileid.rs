@@ -3,8 +3,11 @@ use fish_widestring::wcs2zstring;
 use std::{
     ffi::{CStr, OsStr},
     fs::{self, File, Metadata},
-    os::unix::prelude::*,
 };
+#[cfg(unix)]
+use std::os::unix::prelude::*;
+#[cfg(windows)]
+use osfd_win::prelude::*;
 
 /// Struct for representing a file's inode. We use this to detect and avoid symlink loops, among
 /// other things.
@@ -80,7 +83,13 @@ pub fn file_id_for_path(path: &wstr) -> FileId {
 
 pub fn file_id_for_path_narrow(path: &CStr) -> FileId {
     let path = OsStr::from_bytes(path.to_bytes());
-    fs::metadata(path)
-        .as_ref()
-        .map_or(INVALID_FILE_ID, FileId::from_md)
+    // fish paths are POSIX (`/c/...`); translate to the native Windows form so
+    // `std::fs::metadata` resolves them, instead of treating a leading `/` as the
+    // current drive's root and failing (which would, e.g., make the function
+    // autoloader unable to find `$fish_function_path/<name>.fish`). Identity on POSIX.
+    #[cfg(windows)]
+    let md = fs::metadata(posix_rt::pathconv::posix_to_win(path));
+    #[cfg(not(windows))]
+    let md = fs::metadata(path);
+    md.as_ref().map_or(INVALID_FILE_ID, FileId::from_md)
 }

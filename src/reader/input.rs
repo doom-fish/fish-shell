@@ -8,7 +8,8 @@ use crate::{
 };
 use fish_common::escape;
 use fish_widestring::{WString, bytes2wcstring};
-use std::os::fd::RawFd;
+#[cfg(unix)]    use std::os::fd::RawFd;
+#[cfg(windows)] use osfd_win::RawFd;
 
 impl<'a> InputEventQueuer for Reader<'a> {
     fn get_input_data(&self) -> &InputData {

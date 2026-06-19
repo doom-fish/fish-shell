@@ -18,10 +18,11 @@ use fish_feature_flags::{FeatureFlag, feature_test};
 use nix::sys::{select::FdSet, signal::SigSet, time::TimeSpec};
 use std::{
     collections::VecDeque,
-    os::fd::{BorrowedFd, RawFd},
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
+#[cfg(unix)]    use std::os::fd::{BorrowedFd, RawFd};
+#[cfg(windows)] use osfd_win::{BorrowedFd, RawFd};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReadlineCmdEvent {
@@ -754,6 +755,20 @@ pub(super) enum InputEventTrigger {
 
 pub(super) fn readb(in_fd: RawFd) -> Option<u8> {
     assert!(in_fd >= 0, "Invalid in fd");
+    // When stdin is a real console, pull from the console input-record path so that key
+    // events Windows never surfaces as bytes (Ctrl-Z, control/function/arrow keys) and
+    // window resizes (SIGWINCH) reach the input parser. This blocks until a key byte is
+    // available, draining and acting on non-key records (e.g. resize) inline.
+    #[cfg(windows)]
+    if posix_conpty::is_console_input(in_fd) {
+        return match posix_conpty::next_console_byte(in_fd, true) {
+            posix_conpty::ConsoleByte::Byte(c) => {
+                flog!(reader, "Read byte", char_to_symbol(char::from(c), true));
+                Some(c)
+            }
+            posix_conpty::ConsoleByte::Eof | posix_conpty::ConsoleByte::WouldBlock => None,
+        };
+    }
     let mut arr: [u8; 1] = [0];
     if read_blocked(in_fd, &mut arr) != Ok(1) {
         // The terminal has been closed.
@@ -813,6 +828,18 @@ pub(super) fn next_input_event(
 
         // Check stdin.
         if fdset.test(in_fd) {
+            // When stdin is a console, drain input records non-blockingly: a key produces
+            // a byte, a resize is turned into SIGWINCH inside the reader, and a readiness
+            // caused only by non-key records yields WouldBlock so we re-arm select (rather
+            // than blocking here and starving ioport completions).
+            #[cfg(windows)]
+            if posix_conpty::is_console_input(in_fd) {
+                match posix_conpty::next_console_byte(in_fd, false) {
+                    posix_conpty::ConsoleByte::Byte(b) => return InputEventTrigger::Byte(b),
+                    posix_conpty::ConsoleByte::Eof => return InputEventTrigger::Eof,
+                    posix_conpty::ConsoleByte::WouldBlock => continue,
+                }
+            }
             return readb(in_fd).map_or(InputEventTrigger::Eof, InputEventTrigger::Byte);
         }
 

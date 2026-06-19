@@ -29,7 +29,7 @@ use crate::{
 };
 use fish_common::{UnescapeStringStyle, unescape_string};
 use fish_wcstringutil::join_strings;
-use fish_widestring::{cstr2wcstring, osstr2wcstring, str2wcstring};
+use fish_widestring::{cstr2wcstring, osstr2wcstring, str2wcstring, wcs2osstring};
 use libc::c_int;
 use nix::{
     NixPath as _,
@@ -480,7 +480,7 @@ fn setup_user(global_exported_mode: EnvSetMode, vars: &EnvStack) {
             if userinfo.uid == uid {
                 // The uid matches but we still might need to set $HOME.
                 if vars.get_unless_empty(L!("HOME")).is_none() {
-                    if !userinfo.dir.is_empty() {
+                    if !userinfo.dir.as_os_str().is_empty() {
                         vars.set_one(
                             L!("HOME"),
                             global_exported_mode,
@@ -501,7 +501,7 @@ fn setup_user(global_exported_mode: EnvSetMode, vars: &EnvStack) {
         // Only change $HOME if it's empty, so we allow e.g. `HOME=(mktemp -d)`.
         // This is okay with common `su` and `sudo` because they set $HOME.
         if vars.get_unless_empty(L!("HOME")).is_none() {
-            if !userinfo.dir.is_empty() {
+            if !userinfo.dir.as_os_str().is_empty() {
                 vars.set_one(
                     L!("HOME"),
                     global_exported_mode,
@@ -562,6 +562,92 @@ fn setup_path(global_exported_mode: EnvSetMode) {
 /// This is a simple key->value map and not e.g. cut into paths.
 pub static INHERITED_VARS: OnceLock<HashMap<WString, WString>> = OnceLock::new();
 
+/// Canonicalize the name of an inherited environment variable.
+///
+/// Windows environment variable names are case-insensitive and Windows exposes the search path as
+/// `Path`, but fish treats variable names case-sensitively and uses the canonical name `PATH`
+/// (e.g. `setup_path` looks up `PATH`, and scripts/tests reference `$PATH`). Without canonicalizing,
+/// fish imports `Path` as a separate, unrecognized variable and then clobbers a fresh `PATH` with a
+/// fallback default, collapsing the inherited multi-entry PATH. Map the inherited `Path` to `PATH`.
+#[cfg(windows)]
+fn canonicalize_inherited_key(key: WString) -> WString {
+    if key.to_uppercase() == "PATH" {
+        return L!("PATH").to_owned();
+    }
+    key
+}
+
+#[cfg(not(windows))]
+fn canonicalize_inherited_key(key: WString) -> WString {
+    key
+}
+
+/// Translate an inherited environment value from the native Windows view into fish's POSIX view.
+///
+/// fishbowl runs fish with a Cygwin/MSYS2-style POSIX path model. The OS hands us native paths
+/// (`C:\Windows`, and `;`-separated `PATH`); translate path-typed variables to POSIX (`/c/Windows`,
+/// `:`-separated) so everything inside fish is POSIX. Non-path variables pass through untouched.
+#[cfg(windows)]
+fn translate_inherited_value(key: &wstr, val: WString) -> WString {
+    // `;`-separated search-path variables: split, translate each entry, rejoin with PATH_ARRAY_SEP.
+    // fish auto-treats *any* `*PATH` variable (PATH, CDPATH, MANPATH, FISH_PATH, ...) as a
+    // colon-delimited pathvar and splits it on `:` after import (see variable_should_auto_pathvar +
+    // colon_split). On native Windows these arrive as `;`-separated lists of drive paths
+    // (`C:\a;C:\b`), so they must be translated to POSIX (`/c/a:/c/b`) here first; otherwise the
+    // drive-letter colon in `C:\...` would be shredded by the later colon-split (e.g. a single
+    // `C:\...\fish.exe` would become the two elements `C` and `\...\fish.exe`).
+    if key.to_uppercase().ends_with("PATH") {
+        let native = wcs2osstring(&val).to_string_lossy().into_owned();
+        // Test harnesses and MSYS/Cygwin parents can already provide POSIX-style
+        // colon-delimited path lists (e.g. `/usr/bin:a::b`). Preserve those and
+        // let fish's normal pathvar import split them on `:` and handle empty
+        // entries. Only native Windows lists (`;`-delimited, drive-qualified, or
+        // UNC) need translation here.
+        let bytes = native.as_bytes();
+        let is_drive_path = bytes.len() >= 2
+            && bytes[1] == b':'
+            && bytes[0].is_ascii_alphabetic()
+            && (bytes.len() == 2 || matches!(bytes[2], b'\\' | b'/'));
+        if !native.contains(';') && !is_drive_path && !native.starts_with(r"\\") {
+            return val;
+        }
+        let parts: Vec<String> = native
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(posix_rt::pathconv::win_to_posix)
+            .collect();
+        return str2wcstring(parts.join(":"));
+    }
+    // Single-path variables.
+    if key == "PWD" || key == "HOME" || key == "TMPDIR" || key == "TMP" || key == "TEMP" {
+        let native = wcs2osstring(&val);
+        return str2wcstring(posix_rt::pathconv::win_to_posix(native));
+    }
+    val
+}
+
+#[cfg(not(windows))]
+fn translate_inherited_value(_key: &wstr, val: WString) -> WString {
+    val
+}
+
+/// Expose a config/data directory to fish in its POSIX path domain (`/c/...`).
+///
+/// fish's internal path model is POSIX (see [`translate_inherited_value`]), but the config, data and
+/// sysconf directories are derived from native Windows locations — the `XDG_*` variables and the
+/// executable's own install tree — so they arrive in native (`C:\...`) or mixed form. Surfacing them
+/// unchanged as `__fish_config_dir`, `__fish_data_dir`, `fish_function_path`, etc. breaks fish: the
+/// drive-letter colon splits these colon-delimited path lists and the backslashes defeat globbing.
+/// Translate them to POSIX at this single surfacing boundary. Idempotent on already-POSIX paths.
+#[cfg(windows)]
+fn config_dir_to_posix(native: &wstr) -> WString {
+    str2wcstring(posix_rt::pathconv::win_to_posix(wcs2osstring(native)))
+}
+#[cfg(not(windows))]
+fn config_dir_to_posix(native: &wstr) -> WString {
+    native.to_owned()
+}
+
 pub fn env_init(paths: Option<&ConfigPaths>, no_config: bool) {
     let vars = EnvStack::globals();
 
@@ -569,7 +655,11 @@ pub fn env_init(paths: Option<&ConfigPaths>, no_config: bool) {
     let global_exported_mode = EnvSetMode::new_at_early_startup(EnvMode::GLOBAL | EnvMode::EXPORT);
 
     let env_iter: Vec<_> = std::env::vars_os()
-        .map(|(k, v)| (osstr2wcstring(k), osstr2wcstring(v)))
+        .map(|(k, v)| {
+            let key = canonicalize_inherited_key(osstr2wcstring(k));
+            let val = translate_inherited_value(&key, osstr2wcstring(v));
+            (key, val)
+        })
         .collect();
 
     let mut inherited_vars = HashMap::new();
@@ -612,7 +702,7 @@ pub fn env_init(paths: Option<&ConfigPaths>, no_config: bool) {
                 key,
                 global_mode,
                 maybe_path
-                    .map(|path| vec![osstr2wcstring(path)])
+                    .map(|path| vec![config_dir_to_posix(&osstr2wcstring(path))])
                     .unwrap_or_default(),
             );
         };
@@ -630,7 +720,11 @@ pub fn env_init(paths: Option<&ConfigPaths>, no_config: bool) {
         (FISH_CONFIG_DIR, path_get_config()),
         (FISH_USER_DATA_DIR, path_get_data()),
     ] {
-        vars.set_one(varname, global_mode, validated_path.path.to_owned());
+        vars.set_one(
+            varname,
+            global_mode,
+            config_dir_to_posix(validated_path.path),
+        );
     }
 
     // Set up a default PATH

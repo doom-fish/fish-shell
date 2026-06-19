@@ -28,7 +28,7 @@ pub struct Autoload {
     env_var_name: &'static wstr,
 
     /// A map from command to the files we have autoloaded.
-    autoloaded_files: HashMap<WString, FileId>,
+    autoloaded_files: HashMap<WString, AutoloadedFile>,
 
     /// The list of commands that we are currently autoloading.
     current_autoloading: HashSet<WString>,
@@ -44,6 +44,18 @@ pub struct Asset;
 
 pub fn has_asset(cmd: &str) -> bool {
     Asset::get(cmd).is_some()
+}
+
+/// A record of a file that we have already autoloaded for a command, used to detect when the file
+/// has changed and should be re-sourced. We track the resolved path in addition to the [`FileId`]
+/// because file identity (`dev`/`inode`) is not reliably available on every platform (notably it is
+/// unavailable on native Windows, where it is reported as zero); without the path, two distinct
+/// files in different directories could be mistaken for the same file and a path change (e.g. a
+/// modified `fish_complete_path`) would fail to trigger a reload.
+#[derive(Clone)]
+struct AutoloadedFile {
+    path: WString,
+    file_id: FileId,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -219,13 +231,19 @@ impl Autoload {
         };
 
         let file_id = match &file {
-            AutoloadableFileInfo::OnDisk { file_id, .. } => file_id,
-            AutoloadableFileInfo::Embedded { .. } => &INVALID_FILE_ID,
+            AutoloadableFileInfo::OnDisk { file_id, .. } => file_id.clone(),
+            AutoloadableFileInfo::Embedded { .. } => INVALID_FILE_ID,
+        };
+        let resolved_path: WString = match &file {
+            AutoloadableFileInfo::OnDisk { path, .. } => path.clone(),
+            AutoloadableFileInfo::Embedded { path } => WString::from(path.as_str()),
         };
 
         // Is this file the same as what we previously autoloaded?
+        // Compare both the resolved path and the file identity: a change in either (a different
+        // directory won the path search, or the same file was modified) means we must re-source.
         if let Some(loaded_file) = self.autoloaded_files.get(cmd) {
-            if *loaded_file == *file_id {
+            if loaded_file.file_id == file_id && loaded_file.path == resolved_path {
                 // The file has been autoloaded and is unchanged.
                 return AutoloadResult::Loaded;
             }
@@ -233,8 +251,13 @@ impl Autoload {
 
         // We're going to (tell our caller to) autoload this command.
         self.current_autoloading.insert(cmd.to_owned());
-        self.autoloaded_files
-            .insert(cmd.to_owned(), file_id.clone());
+        self.autoloaded_files.insert(
+            cmd.to_owned(),
+            AutoloadedFile {
+                path: resolved_path,
+                file_id,
+            },
+        );
         AutoloadResult::Path(match file {
             AutoloadableFileInfo::OnDisk { path, .. } => AutoloadPath::OnDisk(path),
             AutoloadableFileInfo::Embedded { path } => AutoloadPath::Embedded(path),

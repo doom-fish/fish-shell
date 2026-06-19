@@ -155,6 +155,7 @@ function __fish_git_files
     test "$root[2]" = true
     and return
     or set -e root[2]
+    set root (path resolve -- $root)
 
     # Cache the translated descriptions so we don't have to get it
     # once per file.

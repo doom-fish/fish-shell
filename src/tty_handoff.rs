@@ -22,7 +22,10 @@ use fish_util::perror;
 use libc::{EINVAL, ENOTTY, EPERM, STDIN_FILENO, WNOHANG};
 use nix::sys::termios::tcgetattr;
 use nix::unistd::getpgrp;
+#[cfg(unix)]
 use std::os::fd::BorrowedFd;
+#[cfg(windows)]
+use osfd_win::BorrowedFd;
 use std::sync::{
     OnceLock,
     atomic::{AtomicPtr, Ordering},

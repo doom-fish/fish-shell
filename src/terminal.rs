@@ -13,9 +13,12 @@ use fish_widestring::{wcs2bytes, wcs2bytes_appending};
 use std::{
     cell::{RefCell, RefMut},
     ops::{Deref, DerefMut},
-    os::{fd::RawFd, unix::ffi::OsStrExt as _},
     sync::atomic::{AtomicU8, Ordering},
 };
+#[cfg(unix)]
+use std::os::{fd::RawFd, unix::ffi::OsStrExt as _};
+#[cfg(windows)]
+use osfd_win::{RawFd, ffi::OsStrExt as _};
 
 bitflags! {
     #[derive(Copy, Clone, Default)]

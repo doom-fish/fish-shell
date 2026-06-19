@@ -1,4 +1,8 @@
-use std::{borrow::Cow, env, os::unix::ffi::OsStrExt as _, path::Path};
+use std::{borrow::Cow, env, path::Path};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(windows)]
+use osfd_win::ffi::OsStrExt as _;
 
 pub fn env_var(name: &str) -> Option<String> {
     let err = match env::var(name) {

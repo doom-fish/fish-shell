@@ -81,7 +81,7 @@ e{cho,cho,cho}
 # Ambiguous case with no space
 PATH= {echo,hello}
 # CHECKERR: fish: Unknown command: echo,hello
-# CHECKERR: {{.*}}/braces.fish (line {{\d+}}):
+# CHECKERR: {{.*}}braces.fish (line {{\d+}}):
 # CHECKERR: PATH= {echo,hello}
 # CHECKERR:        ^~~~~~~~~^
 
@@ -194,7 +194,7 @@ $fish -c '{'
 
 PATH= "{"
 # CHECKERR: fish: Unknown command: '{'
-# CHECKERR: {{.*}}/braces.fish (line {{\d+}}):
+# CHECKERR: {{.*}}braces.fish (line {{\d+}}):
 # CHECKERR: PATH= "{"
 # CHECKERR:       ^~^
 

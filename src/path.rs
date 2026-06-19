@@ -10,11 +10,13 @@ use crate::wutil::{normalize_path, path_normalize_for_cd, waccess, wdirname, wst
 use cfg_if::cfg_if;
 use errno::{Errno, errno, set_errno};
 use fish_widestring::{HOME_DIRECTORY, wcs2osstring, wcs2zstring};
-use libc::{EACCES, ENOENT, ENOTDIR, X_OK};
+use libc::{EACCES, ENOENT, ENOTDIR};
 use nix::unistd::AccessFlags;
-use std::ffi::OsStr;
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::unix::prelude::*;
+#[cfg(windows)]
+use osfd_win::prelude::*;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -165,6 +167,35 @@ fn maybe_issue_path_warning(
     eprintf!("\n");
 }
 
+/// In the Cygwin/MSYS2 path model the Windows executable extension (`.exe`, `.com`, …) is
+/// transparent: a command named `sh` that resolves on disk to `sh.exe` is *presented* as
+/// `/usr/bin/sh`, not `/usr/bin/sh.exe`. `path_get_path`/`path_get_paths` feed the user-facing and
+/// existence-only callers (`type`, `command -v`/`-a`, completion, highlighting), so they strip an
+/// extension that command resolution *appended* — i.e. one the command name did not already carry.
+/// The exec path uses `path_try_get_path` directly and keeps the real extension so `CreateProcessW`
+/// still receives an actual file.
+#[cfg(windows)]
+fn present_resolved_path(cmd: &wstr, resolved: WString) -> WString {
+    // A command name that already carries an executable extension was matched literally; preserve it.
+    if has_executable_extension(cmd) {
+        return resolved;
+    }
+    for ext in executable_extensions() {
+        if resolved.len() > ext.len() && ascii_ci_ends_with(&resolved, ext) {
+            return resolved.as_char_slice()[..resolved.len() - ext.len()]
+                .iter()
+                .copied()
+                .collect();
+        }
+    }
+    resolved
+}
+
+#[cfg(not(windows))]
+fn present_resolved_path(_cmd: &wstr, resolved: WString) -> WString {
+    resolved
+}
+
 /// Finds the path of an executable named `cmd`, by looking in $PATH taken from `vars`.
 /// Returns the path if found, none if not.
 pub fn path_get_path(cmd: &wstr, vars: &dyn Environment) -> Option<WString> {
@@ -172,7 +203,7 @@ pub fn path_get_path(cmd: &wstr, vars: &dyn Environment) -> Option<WString> {
     if result.err.is_some() {
         None
     } else {
-        Some(result.path)
+        Some(present_resolved_path(cmd, result.path))
     }
 }
 
@@ -194,10 +225,48 @@ impl GetPathResult {
 
 pub fn path_try_get_path(cmd: &wstr, vars: &dyn Environment) -> GetPathResult {
     if let Some(path) = vars.get(L!("PATH")) {
+        // On Windows, resolve a small set of commands that fishbowl ships its own
+        // native implementation of — currently `kill`, whose MSYS counterpart only
+        // understands Cygwin pids and so cannot signal a fish-spawned process — from
+        // fish's own program directory ("libexec") first, shadowing the like-named
+        // coreutil. Restricted to that allow-list so general command resolution (and
+        // the user-visible $PATH) is otherwise untouched.
+        #[cfg(windows)]
+        if is_fishbowl_libexec_command(cmd) {
+            if let Some(libexec) = fish_libexec_dir() {
+                let list = path.as_list();
+                let mut paths: Vec<WString> = Vec::with_capacity(list.len() + 1);
+                paths.push(libexec.to_owned());
+                paths.extend(list.iter().cloned());
+                return path_get_path_core(cmd, &paths);
+            }
+        }
         path_get_path_core(cmd, path.as_list())
     } else {
         path_get_path_core(cmd, &FALLBACK_PATH)
     }
+}
+
+/// Commands for which fishbowl provides a native, Win32-aware replacement that must
+/// win over the MSYS coreutil of the same name (see [`fish_libexec_dir`]).
+#[cfg(windows)]
+fn is_fishbowl_libexec_command(cmd: &wstr) -> bool {
+    cmd == L!("kill")
+}
+
+/// Fish's own program directory ("libexec") in fish's POSIX path view, resolved
+/// once from the running executable. `None` if the executable path cannot be
+/// determined.
+#[cfg(windows)]
+fn fish_libexec_dir() -> Option<&'static wstr> {
+    static DIR: LazyLock<Option<WString>> = LazyLock::new(|| {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        Some(WString::from_str(&posix_rt::pathconv::win_to_posix(
+            dir.as_os_str(),
+        )))
+    });
+    DIR.as_ref().map(|w| w.as_utfstr())
 }
 
 fn path_check_executable(path: &wstr) -> Result<(), std::io::Error> {
@@ -208,21 +277,119 @@ fn path_check_executable(path: &wstr) -> Result<(), std::io::Error> {
     let buff = wstat(path)?;
 
     if buff.file_type().is_file() {
+        // Windows has no execute permission bit, so `access(X_OK)` succeeds for any
+        // readable file (e.g. a plain text file). Mirroring Cygwin/MSYS, a file is
+        // executable if its name carries a %PATHEXT% extension *or* it begins with a
+        // `#!` shebang; otherwise reject it so the shell reports "exists but is not an
+        // executable file" instead of trying to spawn an un-runnable file.
+        #[cfg(windows)]
+        if !is_executable_file(path) {
+            return Err(ErrorKind::PermissionDenied.into());
+        }
         Ok(())
     } else {
         Err(ErrorKind::PermissionDenied.into())
     }
 }
 
+/// Windows executable extensions taken from `%PATHEXT%` (e.g. `.COM;.EXE;.BAT;.CMD`),
+/// used to resolve a bare command name such as `cmd` to `cmd.exe`. POSIX has no
+/// analogue, so this is compiled in on Windows only. The list is parsed once and
+/// returned by shared reference — command resolution calls this 30+ times per
+/// lookup, so it must not allocate.
+#[cfg(windows)]
+fn executable_extensions() -> &'static [WString] {
+    static EXTS: std::sync::OnceLock<Vec<WString>> = std::sync::OnceLock::new();
+    EXTS.get_or_init(|| {
+        std::env::var("PATHEXT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(WString::from_str)
+            .collect()
+    })
+    .as_slice()
+}
+
+/// Case-insensitive (ASCII) `s.ends_with(suffix)` over wide strings, allocation
+/// free — used for the per-candidate `%PATHEXT%` suffix test on the hot path.
+#[cfg(windows)]
+fn ascii_ci_ends_with(s: &wstr, suffix: &wstr) -> bool {
+    let s = s.as_char_slice();
+    let suf = suffix.as_char_slice();
+    if s.len() < suf.len() {
+        return false;
+    }
+    s[s.len() - suf.len()..]
+        .iter()
+        .zip(suf.iter())
+        .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+}
+
+/// True if `path` ends with one of the %PATHEXT% executable extensions (case-insensitive).
+#[cfg(windows)]
+fn has_executable_extension(path: &wstr) -> bool {
+    executable_extensions()
+        .iter()
+        .any(|ext| ascii_ci_ends_with(path, ext))
+}
+
+/// True if the file at POSIX `path` begins with a `#!` shebang. The first two
+/// bytes are read through the POSIX->native translating open so the same path
+/// model the rest of fish uses applies. Used to treat extension-less scripts as
+/// executable, exactly as Cygwin/MSYS does.
+#[cfg(windows)]
+fn file_has_shebang(path: &wstr) -> bool {
+    use std::io::Read;
+    let native = posix_rt::pathconv::posix_to_win(wcs2osstring(path));
+    match std::fs::File::open(native) {
+        Ok(mut f) => {
+            let mut buf = [0u8; 2];
+            f.read_exact(&mut buf).is_ok() && &buf == b"#!"
+        }
+        Err(_) => false,
+    }
+}
+
+/// Cygwin/MSYS executability test for a regular file: a `%PATHEXT%` extension
+/// *or* a `#!` shebang makes it runnable, even though Windows has no x-bit.
+#[cfg(windows)]
+fn is_executable_file(path: &wstr) -> bool {
+    has_executable_extension(path) || file_has_shebang(path)
+}
+
 /// Return all the paths that match the given command.
+/// Whether `cmd` denotes a path (so the `$PATH` search is skipped). POSIX recognises
+/// only `/`; on Windows a command is also a path if it contains `\` or is drive-
+/// qualified (`C:\...` or `C:foo`), so native paths like `C:\bin\fish.exe` aren't
+/// mistaken for bare command names and PATH-searched.
+fn command_is_path(cmd: &wstr) -> bool {
+    if cmd.contains('/') {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if cmd.contains('\\') {
+            return true;
+        }
+        let cs = cmd.as_char_slice();
+        if cs.len() >= 2 && cs[1] == ':' && cs[0].is_ascii_alphabetic() {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn path_get_paths(cmd: &wstr, vars: &dyn Environment) -> Vec<WString> {
     flogf!(path, "path_get_paths('%s')", cmd);
     let mut paths = vec![];
 
     // If the command has a slash, it must be an absolute or relative path and thus we don't bother
     // looking for matching commands in the PATH var.
-    if cmd.contains('/') && path_check_executable(cmd).is_ok() {
-        paths.push(cmd.to_owned());
+    if command_is_path(cmd) && path_check_executable(cmd).is_ok() {
+        paths.push(present_resolved_path(cmd, cmd.to_owned()));
         return paths;
     }
 
@@ -236,7 +403,18 @@ pub fn path_get_paths(cmd: &wstr, vars: &dyn Environment) -> Vec<WString> {
         let mut path = path.clone();
         append_path_component(&mut path, cmd);
         if path_check_executable(&path).is_ok() {
-            paths.push(path);
+            paths.push(present_resolved_path(cmd, path));
+        } else {
+            // On Windows, also accept `cmd` resolving to `cmd.exe` etc. via PATHEXT.
+            #[cfg(windows)]
+            for ext in executable_extensions() {
+                let mut cand = path.clone();
+                cand.push_utfstr(ext);
+                if path_check_executable(&cand).is_ok() {
+                    paths.push(present_resolved_path(cmd, cand));
+                    break;
+                }
+            }
         }
     }
 
@@ -248,19 +426,46 @@ fn path_get_path_core<S: AsRef<wstr>>(cmd: &wstr, pathsv: &[S]) -> GetPathResult
     // Test if the given path can be executed.
     // Return 0 on success, an errno value on failure.
     let test_path = |path: &wstr| -> Result<(), Errno> {
-        let narrow = wcs2zstring(path);
-        if unsafe { libc::access(narrow.as_ptr(), X_OK) } != 0 {
+        // Use the `waccess` cover (not raw `libc::access`) so the POSIX path is translated to
+        // native at the boundary on Windows; on POSIX this is a plain access() call.
+        if waccess(path, AccessFlags::X_OK).is_err() {
             return Err(errno());
         }
-        let narrow: Vec<u8> = narrow.into();
-        let Ok(md) = std::fs::metadata(OsStr::from_bytes(&narrow)) else {
+        // Use the `wstat` cover (not a raw `std::fs::metadata`) so the POSIX path is translated
+        // to native at the std boundary on Windows; on POSIX this is plain metadata.
+        let Ok(md) = wstat(path) else {
             return Err(errno());
         };
         if md.is_file() {
+            #[cfg(windows)]
+            if !is_executable_file(path) {
+                return Err(Errno(EACCES));
+            }
             Ok(())
         } else {
             Err(Errno(EACCES))
         }
+    };
+
+    // Resolve `base` to an executable file. On Windows a bare name like `cmd` is
+    // not itself a file, so if the literal path is not executable we retry with
+    // each %PATHEXT% extension (`cmd.exe`, `cmd.bat`, …) and return the first hit.
+    // On success the *resolved* path (with extension) is returned, so the caller
+    // hands CreateProcessW a real file. On other platforms this is just test_path.
+    let resolve = |base: &wstr| -> Result<WString, Errno> {
+        let first = test_path(base);
+        if first.is_ok() {
+            return Ok(base.to_owned());
+        }
+        #[cfg(windows)]
+        for ext in executable_extensions() {
+            let mut cand = base.to_owned();
+            cand.push_utfstr(ext);
+            if test_path(&cand).is_ok() {
+                return Ok(cand);
+            }
+        }
+        Err(first.unwrap_err())
     };
 
     if cmd.is_empty() {
@@ -274,8 +479,11 @@ fn path_get_path_core<S: AsRef<wstr>>(cmd: &wstr, pathsv: &[S]) -> GetPathResult
 
     // If the command has a slash, it must be an absolute or relative path and thus we don't bother
     // looking for a matching command.
-    if cmd.contains('/') {
-        return GetPathResult::new(test_path(cmd).err(), cmd.to_owned());
+    if command_is_path(cmd) {
+        return match resolve(cmd) {
+            Ok(resolved) => GetPathResult::new(None, resolved),
+            Err(err) => GetPathResult::new(Some(err), cmd.to_owned()),
+        };
     }
 
     let mut best = noent_res;
@@ -286,10 +494,10 @@ fn path_get_path_core<S: AsRef<wstr>>(cmd: &wstr, pathsv: &[S]) -> GetPathResult
         }
         let mut proposed_path = next_path.to_owned();
         append_path_component(&mut proposed_path, cmd);
-        match test_path(&proposed_path) {
-            Ok(()) => {
+        match resolve(&proposed_path) {
+            Ok(resolved) => {
                 // We found one.
-                return GetPathResult::new(None, proposed_path);
+                return GetPathResult::new(None, resolved);
             }
             Err(err) => {
                 if err.0 != ENOENT && best.err == Some(Errno(ENOENT)) {
@@ -617,6 +825,15 @@ fn make_base_directory(xdg_var: &wstr, non_xdg_homepath: &wstr) -> BaseDirectory
         CreatedDir,
     }
     let result = {
+        // `path` is in fish's POSIX domain (`/c/...`). `std::fs` (used by `create_dir`) calls the
+        // Win32 API directly and needs a native path, unlike fish's libc/`nix` file helpers which
+        // fishbowl shims to accept POSIX. Without this the config/data directory is created at the
+        // wrong location (a leading `/` is treated as the current drive root), so later writes
+        // (e.g. the universal-variable file) fail with "path not found". Identity off Windows, and
+        // idempotent on already-native paths.
+        #[cfg(windows)]
+        let path = PathBuf::from(posix_rt::pathconv::posix_to_win(wcs2osstring(&path)));
+        #[cfg(not(windows))]
         let path = PathBuf::from(wcs2osstring(&path));
         use std::io::ErrorKind::{AlreadyExists, NotFound};
         let mut recursive = false;
@@ -653,7 +870,10 @@ fn create_dir<P: AsRef<std::path::Path>>(
     mode: u32,
     recursive: bool,
 ) -> std::io::Result<()> {
+    #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt as _;
+    #[cfg(windows)]
+    use osfd_win::fs::DirBuilderExt as _;
     std::fs::DirBuilder::new()
         .recursive(recursive)
         .mode(mode)
@@ -748,6 +968,13 @@ static CACHE_DIRECTORY: LazyLock<BaseDirectory> =
 static CONFIG_DIRECTORY: LazyLock<BaseDirectory> = LazyLock::new(|| {
     let config_dir = make_base_directory(L!("XDG_CONFIG_HOME"), L!("/.config/fish"));
     if config_dir.created {
+        // `std::fs` needs native paths on Windows; see `make_base_directory`. Translate the POSIX
+        // config directory once so the subdirectory creation and the config.fish write below land
+        // in the real location. Identity off Windows.
+        #[cfg(windows)]
+        let mut path =
+            PathBuf::from(posix_rt::pathconv::posix_to_win(wcs2osstring(&config_dir.path)));
+        #[cfg(not(windows))]
         let mut path = PathBuf::from(wcs2osstring(&config_dir.path));
         for basename in ["completions", "conf.d", "functions"] {
             path.push(basename);

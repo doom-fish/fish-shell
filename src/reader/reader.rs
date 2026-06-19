@@ -108,8 +108,10 @@ use crate::{
         deactivate_tty_protocols, get_tty_protocols_active, initialize_tty_protocols,
     },
     wildcard::wildcard_has,
-    wutil::{fstat, perror_nix, wstat},
+    wutil::{perror_nix, wstat},
 };
+#[cfg(not(windows))]
+use crate::wutil::fstat;
 use assert_matches::assert_matches;
 use errno::{Errno, errno};
 use fish_common::{
@@ -146,7 +148,6 @@ use std::{
     io::BufReader,
     num::NonZeroUsize,
     ops::{ControlFlow, DerefMut, Range},
-    os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd},
     pin::Pin,
     sync::{
         Arc, LazyLock, Mutex, MutexGuard, OnceLock,
@@ -154,6 +155,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+#[cfg(unix)]    use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
+#[cfg(windows)] use osfd_win::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 
 /// A description of where fish is in the process of exiting.
 #[repr(u8)]
@@ -923,8 +926,25 @@ fn read_i(parser: &mut Parser) {
 /// highlighting. This is used for reading scripts and init files.
 /// The file is not closed.
 fn read_ni(parser: &mut Parser, fd: RawFd, io: &IoChain) -> Result<(), ErrorCode> {
-    let md = match fstat(fd) {
-        Ok(md) => md,
+    // Determine whether the source is a directory (which cannot be read) and a
+    // size hint for the read buffer. On Windows the std `fstat` (via
+    // `GetFileInformationByHandle`) fails for character devices such as the `NUL`
+    // device backing `/dev/null`, so consult the Win32-backed runtime stat, which
+    // classifies char devices and pipes as readable (empty) streams.
+    #[cfg(windows)]
+    let (is_dir, size_hint) = match nix::sys::stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }) {
+        Ok(md) => (md.st_mode & 0o170000 == 0o040000, md.st_size.max(0) as u64),
+        Err(err) => {
+            flog!(
+                error,
+                wgettext_fmt!("Unable to read input file: %s", err.to_string())
+            );
+            return Err(STATUS_CMD_ERROR);
+        }
+    };
+    #[cfg(not(windows))]
+    let (is_dir, size_hint) = match fstat(fd) {
+        Ok(md) => (md.is_dir(), md.len()),
         Err(err) => {
             flog!(
                 error,
@@ -937,16 +957,25 @@ fn read_ni(parser: &mut Parser, fd: RawFd, io: &IoChain) -> Result<(), ErrorCode
     /* FreeBSD allows read() on directories. Error explicitly in that case. */
     // XXX: This can be triggered spuriously, so we'll not do that for stdin.
     // This can be seen e.g. with node's "spawn" api.
-    if fd != STDIN_FILENO && md.is_dir() {
+    if fd != STDIN_FILENO && is_dir {
+        // The POSIX `EISDIR` description is "Is a directory". The `errno` crate's
+        // `Display` resolves the text through the platform `strerror`, which on
+        // Windows mistranslates errno 21 to the unrelated Win32 message "The
+        // device is not ready" (`ERROR_NOT_READY` is also 21). Use the runtime's
+        // POSIX errno description there so the wording matches POSIX.
+        #[cfg(windows)]
+        let eisdir_msg = nix::Errno::EISDIR.to_string();
+        #[cfg(not(windows))]
+        let eisdir_msg = Errno(EISDIR).to_string();
         flog!(
             error,
-            wgettext_fmt!("Unable to read input file: %s", Errno(EISDIR).to_string())
+            wgettext_fmt!("Unable to read input file: %s", eisdir_msg)
         );
         return Err(STATUS_CMD_ERROR);
     }
 
     // Read all data into a vec.
-    let mut fd_contents = Vec::with_capacity(usize::try_from(md.len()).unwrap());
+    let mut fd_contents = Vec::with_capacity(usize::try_from(size_hint).unwrap());
     loop {
         let mut buff = [0_u8; 4096];
 
@@ -2776,6 +2805,28 @@ impl<'a> Reader<'a> {
         self.force_exec_prompt_and_repaint = false;
     }
 
+    /// Forward SIGTSTP to the foreground job's process group when the input layer reads a ^Z
+    /// keypress. Returns true if a foreground job (a process group distinct from fish's own)
+    /// owned the controlling terminal and the signal was forwarded; false otherwise (e.g. at the
+    /// prompt, where fish itself is the foreground group and ^Z must not suspend the shell).
+    fn forward_ctrl_z_to_foreground_job(&self) -> bool {
+        let fg = unsafe { libc::tcgetpgrp(self.conf.inputfd) };
+        let me = unsafe { libc::getpgrp() };
+        if fg <= 0 || fg == me {
+            return false;
+        }
+        if let Err(err) = killpg(nix::unistd::Pid::from_raw(fg), Signal::SIGTSTP) {
+            flog!(
+                reader,
+                "killpg(SIGTSTP) to foreground group",
+                fg,
+                "failed:",
+                err.to_string()
+            );
+        }
+        true
+    }
+
     fn handle_char_event(&mut self, injected_event: Option<CharEvent>) -> ControlFlow<()> {
         if self.reset_loop_state {
             self.reset_loop_state = false;
@@ -2869,6 +2920,17 @@ impl<'a> Reader<'a> {
                 self.run_input_command_scripts(&command);
             }
             CharEvent::Key(kevt) => {
+                // Native Windows: there is no terminal line discipline to turn a ^Z keypress
+                // into SIGTSTP, and the console raises no control event for it (^Z is delivered
+                // as the SUB byte 0x1A). If the input layer reads a ^Z while a foreground job
+                // (a process group other than fish's own) owns the controlling terminal, forward
+                // SIGTSTP to that group so the job-control layer suspends it; `fg`/`bg` later
+                // resume it via SIGCONT. At the prompt the foreground group is fish itself, so
+                // this is a no-op and ^Z falls through to normal (insert) handling.
+                if kevt.key.key == crate::key::ctrl('z') && self.forward_ctrl_z_to_foreground_job() {
+                    self.rls_mut().last_cmd = None;
+                    return ControlFlow::Continue(());
+                }
                 // Ordinary char.
                 if kevt.input_style == CharInputStyle::NotFirst
                     && self.active_edit_line().1.position() == 0

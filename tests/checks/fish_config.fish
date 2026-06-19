@@ -64,7 +64,7 @@ cat $__fish_config_dir/functions/fish_mode_prompt.fish
 
 fish_config prompt choose nim
 type fish_prompt fish_right_prompt fish_mode_prompt |
-    grep -EA1 '^function.*|.*\[nim@Hattori:~\].*'
+    grep -EA1 '^function.*|.*[[]nim@Hattori:~[]].*'
 # CHECK: function fish_prompt
 # CHECK: # This prompt shows:
 # CHECK: --

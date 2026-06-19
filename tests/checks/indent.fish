@@ -686,7 +686,7 @@ cat $tmpdir/indent_test.fish
 echo 'echo "foo" "bar"' >$tmpdir/indent_test.fish
 chmod 400 $tmpdir/indent_test.fish
 $fish_indent --write $tmpdir/indent_test.fish
-# CHECKERR: Opening "{{.*}}/indent_test.fish" failed: {{.*}})
+# CHECKERR: Opening "{{.*}}indent_test.fish" failed: {{.*}})
 
 # See that the builtin can be redirected
 printf %s\n a b c | builtin fish_indent | grep b

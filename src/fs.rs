@@ -12,18 +12,28 @@ use nix::{fcntl::OFlag, sys::stat::Mode};
 use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
-    os::{
-        fd::AsRawFd as _,
-        unix::{ffi::OsStringExt as _, fs::MetadataExt as _},
-    },
     path::PathBuf,
 };
+#[cfg(unix)]
+use std::os::{
+    fd::AsRawFd as _,
+    unix::{ffi::OsStringExt as _, fs::MetadataExt as _},
+};
+#[cfg(windows)]
+use osfd_win::{AsRawFd as _, ffi::OsStringExt as _, fs::MetadataExt as _};
 
 /// Creates a temporary file in the same directory as as `original_path`, meaning `original_path`
 /// must be a valid file path. The filename will be created by appending random alphanumeric ASCII
 /// chars to the `original_filename`.
 fn create_temporary_file(original_path: &wstr) -> std::io::Result<(File, WString)> {
     let original_path = PathBuf::from(OsString::from_vec(wcs2bytes(original_path)));
+    // fish-internal paths use forward-slash (cygwin) form, but the tempfile
+    // helper opens via std::fs, which cannot resolve a `/d/...`-style path and
+    // whose `Path::join` would also insert a backslash into it. Convert to the
+    // native Windows path up front (idempotent on already-native paths) so
+    // std::fs sees `D:\...` and the join uses a consistent separator.
+    #[cfg(windows)]
+    let original_path = posix_rt::pathconv::posix_to_win(original_path.as_os_str());
     // original path must be a valid file path, so file_name should never return None.
     let prefix = original_path.file_name().unwrap().to_owned();
     let dir = original_path.parent().unwrap();
@@ -301,7 +311,11 @@ where
         // did, it would be tricky to set the permissions correctly. (bash doesn't get this
         // case right either).
         if let Ok(md) = old_file.metadata() {
-            if let Err(e) = std::os::unix::fs::fchown(new_file, Some(md.uid()), Some(md.gid())) {
+            #[cfg(unix)]
+            use std::os::unix::fs::fchown;
+            #[cfg(windows)]
+            use osfd_win::fs::fchown;
+            if let Err(e) = fchown(new_file, Some(md.uid()), Some(md.gid())) {
                 flog!(
                     synced_file_access,
                     "Error when changing ownership of file:",
@@ -348,7 +362,17 @@ where
 
     /// Renames a file from `old_name` to `new_name`.
     fn rename(old_name: &wstr, new_name: &wstr) -> std::io::Result<()> {
-        if let Err(e) = std::fs::rename(wcs2osstring(old_name), wcs2osstring(new_name)) {
+        // fish passes forward-slash (cygwin) paths, but std::fs::rename cannot
+        // resolve `/d/...`-style paths; convert both to the native Windows path
+        // first (idempotent on already-native paths).
+        #[cfg(windows)]
+        let (old, new) = (
+            posix_rt::pathconv::posix_to_win(wcs2osstring(old_name)),
+            posix_rt::pathconv::posix_to_win(wcs2osstring(new_name)),
+        );
+        #[cfg(not(windows))]
+        let (old, new) = (wcs2osstring(old_name), wcs2osstring(new_name));
+        if let Err(e) = std::fs::rename(old, new) {
             flog!(
                 error,
                 wgettext_fmt!("Error when renaming file: %s", e.to_string())

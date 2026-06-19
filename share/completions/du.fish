@@ -1,6 +1,14 @@
 # test if we are using GNU du
 set -l is_gnu
-if du --version &>/dev/null
+# On some hosts (notably Windows) `du` may resolve to a non-coreutils program
+# such as Sysinternals du, whose first run blocks on an interactive prompt and
+# never returns. Bound the probe with `timeout` when available so that merely
+# sourcing this completion can never hang the shell.
+if command -q timeout
+    if command timeout -s KILL 1 du --version &>/dev/null
+        set is_gnu --is-gnu
+    end
+else if du --version &>/dev/null
     set is_gnu --is-gnu
 end
 

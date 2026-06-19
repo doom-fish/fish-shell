@@ -12,6 +12,21 @@ fn main() {
 
     setup_paths();
 
+    // On Windows, `Path::canonicalize` returns an extended-length (`\\?\`) verbatim path.
+    // Verbatim paths are not normalized by `std::fs`, so any later concatenation that uses
+    // forward slashes (e.g. RustEmbed's `#[folder = "$FISH_RESOLVED_BUILD_DIR/.../man1"]`)
+    // becomes unresolvable. Strip the prefix so the exported dirs are plain paths.
+    fn canonicalize_plain(p: impl AsRef<std::path::Path>) -> String {
+        let s = p
+            .as_ref()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+    }
+
     // Add our default to enable tools that don't go through CMake, like "cargo test" and the
     // language server.
 
@@ -19,15 +34,12 @@ fn main() {
         "FISH_RESOLVED_BUILD_DIR",
         // If set by CMake, this might include symlinks. Since we want to compare this to the
         // dir fish is executed in we need to canonicalize it.
-        fish_build_dir().canonicalize().unwrap().to_str().unwrap(),
+        &canonicalize_plain(&*fish_build_dir()),
     );
 
     // We need to canonicalize (i.e. realpath) the manifest dir because we want to be able to
     // compare it directly as a string at runtime.
-    rsconf::set_env_value(
-        "CARGO_MANIFEST_DIR",
-        workspace_root().canonicalize().unwrap().to_str().unwrap(),
-    );
+    rsconf::set_env_value("CARGO_MANIFEST_DIR", &canonicalize_plain(workspace_root()));
 
     // Some build info
     rsconf::set_env_value("BUILD_TARGET_TRIPLE", &env_var("TARGET").unwrap());
@@ -84,7 +96,12 @@ fn detect_cfgs(target: &mut Target) {
         }),
         ("have_pipe2", &|target| target.has_symbol("pipe2")),
         ("have_posix_spawn", &|target| {
-            if matches!(target_os().as_str(), "openbsd" | "android") {
+            if target_os() == "windows" {
+                // fishbowl backs posix_spawn with CreateProcessW. Windows has no
+                // fork(), so the posix_spawn path is mandatory, not a perf option;
+                // force the cfg on rather than probing for a (absent) spawn.h.
+                true
+            } else if matches!(target_os().as_str(), "openbsd" | "android") {
                 // OpenBSD's posix_spawn returns status 127 instead of erroring with ENOEXEC when faced with a
                 // shebang-less script. Disable posix_spawn on OpenBSD.
                 //
@@ -193,13 +210,18 @@ fn setup_paths() {
 
 fn get_version() -> String {
     use std::process::Command;
-    String::from_utf8(
-        Command::new("build_tools/git_version_gen.sh")
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim_ascii_end()
-    .to_owned()
+    // An explicit override always wins (and is how packagers pin the version).
+    if let Ok(v) = std::env::var("FISH_BUILD_VERSION") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    // The git/sh version generator is a POSIX shell script; when it cannot run (e.g. a
+    // native Windows build with no `sh`), fall back to the crate version.
+    Command::new("build_tools/git_version_gen.sh")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim_ascii_end().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
 }

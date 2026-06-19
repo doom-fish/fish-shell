@@ -389,7 +389,7 @@ complete banana
 complete banana bar
 #CHECKERR: complete: too many arguments
 #CHECKERR:
-#CHECKERR: {{.*}}checks/complete.fish (line {{\d+}}):
+#CHECKERR: {{.*}}complete.fish (line {{\d+}}):
 #CHECKERR: complete banana bar
 #CHECKERR: ^
 #CHECKERR:

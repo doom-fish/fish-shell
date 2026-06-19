@@ -680,7 +680,12 @@ impl ExecutionContext {
                 self.populate_block_process(ctx, proc, statement)
             }
             Statement::Decorated(decorated_statement) => {
-                self.populate_plain_process(ctx, proc, decorated_statement)
+                self.populate_plain_process(
+                    ctx,
+                    proc,
+                    decorated_statement,
+                    job.is_initially_background(),
+                )
             }
         }
     }
@@ -711,6 +716,7 @@ impl ExecutionContext {
         ctx: &mut OperationContext<'_>,
         proc: &mut Process,
         statement: &ast::DecoratedStatement,
+        job_is_background: bool,
     ) -> EndExecutionReason {
         // We may decide that a command should be an implicit cd.
         let mut use_implicit_cd = false;
@@ -735,7 +741,7 @@ impl ExecutionContext {
 
         // Determine the process type.
         let mut process_type = self.process_type_for_command(ctx, statement, &cmd);
-        let external_cmd = if matches!(process_type, ProcessType::External | ProcessType::Exec) {
+        let mut external_cmd = if matches!(process_type, ProcessType::External | ProcessType::Exec) {
             let parser = ctx.parser();
             // Determine the actual command. This may be an implicit cd.
             let external_cmd = path_try_get_path(&cmd, parser.vars());
@@ -814,6 +820,28 @@ impl ExecutionContext {
                 self.determine_redirections(ctx, &statement.args_or_redirs, &mut redirections);
             if reason != EndExecutionReason::Ok {
                 return reason;
+            }
+        }
+
+        // On Windows there is no fork(): a backgrounded "blocking" builtin such as
+        // `sleep N &` would otherwise run as fish's pid-less InternalProc, which has no
+        // process group and cannot take part in job control (`jobs -p`, `kill -STOP`,
+        // `wait`, `disown`, `--on-job-exit`). When such a builtin is backgrounded, route
+        // it through the external command of the same name (fishbowl ships coreutils) so
+        // it gets a real pid + pgroup and the full external lifecycle, exactly like
+        // `command sleep N &`. The fast in-process foreground builtin is untouched.
+        #[cfg(not(windows))]
+        let _ = job_is_background;
+        #[cfg(windows)]
+        if job_is_background
+            && matches!(process_type, ProcessType::Builtin)
+            && !cmd_args.is_empty()
+            && &cmd_args[0][..] == L!("sleep")
+        {
+            let resolved = path_try_get_path(&cmd_args[0], ctx.parser().vars());
+            if resolved.err.is_none() {
+                process_type = ProcessType::External;
+                external_cmd = resolved.path;
             }
         }
 

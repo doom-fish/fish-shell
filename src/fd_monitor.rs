@@ -9,7 +9,12 @@ use fish_common::exit_without_destructors;
 use fish_util::perror;
 use libc::{EAGAIN, EINTR, EWOULDBLOCK};
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::prelude::*;
+#[cfg(windows)]
+use osfd_win::prelude::*;
+#[cfg(windows)]
+use osfd_win::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -506,7 +511,10 @@ mod tests {
     use crate::portable_atomic::AtomicU64;
     use std::fs::File;
     use std::io::Write as _;
+    #[cfg(unix)]
     use std::os::fd::OwnedFd;
+    #[cfg(windows)]
+    use osfd_win::OwnedFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;

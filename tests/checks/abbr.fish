@@ -141,7 +141,7 @@ echo $status
 abbr --query banana --function
 echo $status
 # CHECKERR: abbr: --function: option requires an argument
-# CHECKERR: {{.*}}checks/abbr.fish (line 141):
+# CHECKERR: {{.*}}abbr.fish (line 141):
 # CHECKERR: abbr --query banana --function
 # CHECKERR: ^
 # CHECKERR: (Type 'help abbr' for related documentation)
@@ -281,7 +281,7 @@ abbr --erase sub2 --command={foo,bar}
 abbr --erase (abbr --list)
 abbr -U
 # CHECKERR: abbr: Warning: Option '-U' was removed and is now ignored
-# CHECKERR: {{.*}}checks/abbr.fish (line {{\d+}}):
+# CHECKERR: {{.*}}abbr.fish (line {{\d+}}):
 # CHECKERR: abbr -U
 # CHECKERR: ^
 # CHECKERR: (Type 'help abbr' for related documentation)

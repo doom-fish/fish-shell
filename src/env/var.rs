@@ -8,6 +8,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The character used to delimit path and non-path variables in exporting and in string expansion.
+///
+/// fishbowl runs fish with a Cygwin/MSYS2-style POSIX path model: inside fish every path is
+/// `/c/...` (no drive-letter colons), so `:` is a safe array separator just like on real POSIX,
+/// and keeps `$PATH` Cygwin-consistent. The win<->posix translation happens at the OS boundary.
 pub const PATH_ARRAY_SEP: char = ':';
 pub const NONPATH_ARRAY_SEP: char = ' ';
 

@@ -4,7 +4,8 @@
 use super::{Reader, reader};
 use crate::fd_monitor::FdEventSignaller;
 use crate::threads::{Debounce, ThreadPool};
-use std::os::unix::io::RawFd;
+#[cfg(unix)]    use std::os::unix::io::RawFd;
+#[cfg(windows)] use osfd_win::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
 

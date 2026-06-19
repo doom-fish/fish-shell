@@ -221,6 +221,15 @@ pub struct Screen {
 
     /// Vertical offset of the screen contents within the terminal window.
     viewport_y: Option<usize>,
+    /// The number of committed lines above the current prompt (output from earlier
+    /// commands that is still on screen). Set when a new prompt is established, the
+    /// screen is cleared, or content is pushed to scrollback. Used to cap the
+    /// viewport offset reported after a window resize: when a window *shrinks*, the
+    /// terminal can reflow the current command's own multi-line autosuggestion above
+    /// the prompt and report the prompt lower than it really is; clamping to this
+    /// baseline reclaims that space (pulling the prompt back up) without overwriting
+    /// genuinely committed content from earlier commands.
+    committed_baseline: Option<usize>,
     /// The internal representation of the desired screen contents.
     desired: ScreenData,
     /// The internal representation of the actual screen contents.
@@ -254,6 +263,7 @@ impl Default for Screen {
             scrolled: Default::default(),
             outp: Outputter::stdoutput(),
             viewport_y: Default::default(),
+            committed_baseline: Default::default(),
             desired: Default::default(),
             actual: Default::default(),
             actual_left_prompt: Default::default(),
@@ -576,6 +586,29 @@ impl Screen {
     }
 
     pub fn set_position_in_viewport(&mut self, whence: &str, viewport_y: Option<usize>) {
+        // A window resize re-syncs the viewport from a terminal cursor-position
+        // report, which can over-count the lines above the prompt (the current
+        // command's own autosuggestion reflowed above it after a shrink). Clamp to
+        // the committed baseline so we don't strand the prompt at the bottom with
+        // reclaimable stale lines above it. New prompts / clears / scrollback pushes
+        // *redefine* that baseline.
+        let viewport_y = match whence {
+            "cursor position query on window height change" => {
+                // Clamp (never grow) to the committed baseline. The baseline itself
+                // is NOT updated here: committed content that scrolls off during a
+                // shrink reappears when the window grows back, so the count of
+                // committed lines above the prompt is fixed until the next prompt.
+                match (viewport_y, self.committed_baseline) {
+                    (Some(v), Some(b)) => Some(v.min(b)),
+                    (other, _) => other,
+                }
+            }
+            "cursor position query on new prompt" | "screen clear" | "scrollback-push" => {
+                self.committed_baseline = viewport_y;
+                viewport_y
+            }
+            _ => viewport_y,
+        };
         flogf!(
             reader,
             "Setting screen y to %s due to %s",
@@ -1259,7 +1292,15 @@ impl Screen {
                 clear_remainder = false;
             } else if need_clear_lines && screen_width.is_some_and(|sw| current_width < sw) {
                 clear_remainder = true;
-            } else if right_prompt_width < self.last_right_prompt_width {
+            } else if right_prompt_width < self.last_right_prompt_width
+                && screen_width.is_some_and(|sw| current_width < sw)
+            {
+                // The right prompt shrank (or was hidden), so clear any stale right
+                // prompt still on screen. But only if we did NOT write to the end of
+                // the line: at the sticky right edge a clear-to-end-of-line erases the
+                // last character we wrote (and, with a soft-wrapped line, the first
+                // character of the next row). A line written to the full width has no
+                // room for a stale right prompt anyway, since content overwrote it.
                 clear_remainder = true;
             } else {
                 // This wcswidth shows up strong in the profile.

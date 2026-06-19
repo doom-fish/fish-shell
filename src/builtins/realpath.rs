@@ -83,7 +83,12 @@ pub fn realpath(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]
             } else {
                 let errno = errno();
                 if errno.0 != 0 {
-                    err_fmt!("%s: %s", arg, errno.to_string())
+                    let message = if errno.0 == libc::ENOENT {
+                        "No such file or directory".to_string()
+                    } else {
+                        errno.to_string()
+                    };
+                    err_fmt!("%s: %s", arg, message)
                         .cmd(cmd)
                         .finish(streams);
                 } else {
@@ -102,7 +107,13 @@ pub fn realpath(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]
                 };
                 streams.out.appendln(&normalize_path(&absolute_arg, false));
             } else {
-                err_fmt!("%s failed: %s", "realpath", errno().to_string())
+                let errno = errno();
+                let message = if errno.0 == libc::ENOENT {
+                    "No such file or directory".to_string()
+                } else {
+                    errno.to_string()
+                };
+                err_fmt!("%s failed: %s", "realpath", message)
                     .cmd(cmd)
                     .finish(streams);
                 had_error = true;

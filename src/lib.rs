@@ -6,6 +6,12 @@
 
 pub const BUILD_VERSION: &str = env!("FISH_BUILD_VERSION");
 
+// Force the fishbowl POSIX C-ABI shim (`posix-abi`) to be linked into the final binary, so
+// the unix-only `libc::*` symbols fish references (kill, waitpid, sigaction, fcntl, …) are
+// resolved by the fishbowl runtime rather than left undefined.
+#[cfg(windows)]
+use posix_abi as _;
+
 #[macro_use]
 pub mod common;
 

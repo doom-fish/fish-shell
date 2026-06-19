@@ -4,8 +4,12 @@ use crate::{
     reader::reader_read,
 };
 use fish_common::{FilenameRef, escape};
+use fish_widestring::str2wcstring;
 use nix::{fcntl::OFlag, sys::stat::Mode};
+#[cfg(unix)]
 use std::os::fd::AsRawFd as _;
+#[cfg(windows)]
+use osfd_win::AsRawFd as _;
 
 /// The  source builtin, sometimes called `.`. Evaluates the contents of a file in the current
 /// context.
@@ -51,11 +55,18 @@ pub fn source(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]) 
             Ok(file) => {
                 opened_file = file;
             }
-            Err(_) => {
+            Err(err) => {
+                // Capture the open() errno directly from the result and render the
+                // POSIX strerror text from it. Reading the global errno later is
+                // fragile on Windows, where intervening allocations reset the
+                // thread's last-error slot and the C runtime would surface a Win32
+                // message ("The system cannot find the file specified.") rather than
+                // the POSIX wording fish's callers expect.
+                let strerr = str2wcstring(err.to_string());
                 let esc = escape(args[optind]);
                 err_fmt!("Error encountered while sourcing file '%s':", &esc)
                     .append_to_msg('\n')
-                    .append_to_msg(&err_raw!(&builtin_strerror()).cmd(cmd).to_string())
+                    .append_to_msg(&err_raw!(&strerr).cmd(cmd).to_string())
                     .cmd(cmd)
                     .finish(streams);
 

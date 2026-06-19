@@ -26,7 +26,7 @@ function __fish_theme_migrate
             end
             __fish_theme_freeze __fish_theme_migrate $theme_data
             set msg_suffix " by default."\n"  Migrated them to global variables set in $(set_color --underline)$(
-                    __fish_unexpand_tilde $__fish_config_dir/conf.d/fish_frozen_theme.fish
+                    __fish_unexpand_tilde $__fish_config_dir/conf.d/fish_frozen_theme.fish | string replace -a -- \\ /
                 )$(set_color --reset)"
         end
         set -a msg "* Color variables are no longer set in universal scope$msg_suffix"
@@ -61,7 +61,7 @@ $(
 set --erase --universal fish_key_bindings"
         set -a msg '* The fish_key_bindings variable is no longer set in universal scope by default.'
         set -a msg (echo -s "  Migrated it to a global variable set in  " \
-            "$(set_color --underline)$(__fish_unexpand_tilde $filename)" \
+            "$(set_color --underline)$(__fish_unexpand_tilde $filename | string replace -a -- \\ /)" \
             (set_color --reset))
         source $__fish_config_dir/$relative_filename
     end

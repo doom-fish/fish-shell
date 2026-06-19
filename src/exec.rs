@@ -60,13 +60,16 @@ use std::{
     io::{Read as _, Write as _},
     mem::MaybeUninit,
     num::NonZeroU32,
-    os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
     slice,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+#[cfg(windows)]
+use osfd_win::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 
 /// The singleton shared exec thread pool.
 /// This is used to write the output of internal processes (e.g. builtins)
@@ -403,7 +406,18 @@ fn signal_safe_launch_process(
 ) -> ! {
     // This function never returns, so we take certain liberties with constness.
 
-    unsafe { libc::execve(actual_cmd.as_ptr(), argv.get(), envv.get()) };
+    // On Windows the mingw CRT's `_execve` (which `libc::execve` links to) mangles
+    // the environment block, dropping vars like the exec-decremented SHLVL. Route
+    // process replacement through fishbowl's own mechanism, which spawns + waits +
+    // exits with the child's status, preserving the environment fish built.
+    #[cfg(windows)]
+    unsafe {
+        posix_abi::imp::exec_replace(actual_cmd.as_ptr(), argv.get(), envv.get());
+    }
+    #[cfg(not(windows))]
+    unsafe {
+        libc::execve(actual_cmd.as_ptr(), argv.get(), envv.get());
+    }
     let err = errno();
 
     // The shebang wasn't introduced until UNIX Seventh Edition, so if
@@ -468,21 +482,34 @@ fn can_use_posix_spawn_for_job(job: &Job, dup2s: &Dup2List) -> bool {
         return false;
     }
 
-    // Hack - do not use posix_spawn if there are self-fd redirections.
-    // For example if you were to write:
-    //   cmd 6< /dev/null
-    // it is possible that the open() of /dev/null would result in fd 6. Here even if we attempted
-    // to add a dup2 action, it would be ignored and the CLOEXEC bit would remain. So don't use
-    // posix_spawn in this case; instead we'll call fork() and clear the CLOEXEC bit manually.
-    for action in dup2s.get_actions() {
-        if action.src == action.target {
-            return false;
-        }
+    // Windows has no fork(): posix_spawn (CreateProcessW) is the only way to launch an
+    // external command, so we must use it for every job. Our spawn applies all fd actions
+    // and sets the process group (POSIX_SPAWN_SETPGROUP); terminal handoff for a
+    // foregrounded job is done via tcsetpgrp() after the spawn returns.
+    #[cfg(windows)]
+    {
+        let _ = (job, dup2s);
+        return true;
     }
-    // If this job will be foregrounded, we will call tcsetpgrp(), therefore do not use
-    // posix_spawn.
-    let wants_terminal = job.group().wants_terminal();
-    !wants_terminal
+
+    #[cfg(not(windows))]
+    {
+        // Hack - do not use posix_spawn if there are self-fd redirections.
+        // For example if you were to write:
+        //   cmd 6< /dev/null
+        // it is possible that the open() of /dev/null would result in fd 6. Here even if we attempted
+        // to add a dup2 action, it would be ignored and the CLOEXEC bit would remain. So don't use
+        // posix_spawn in this case; instead we'll call fork() and clear the CLOEXEC bit manually.
+        for action in dup2s.get_actions() {
+            if action.src == action.target {
+                return false;
+            }
+        }
+        // If this job will be foregrounded, we will call tcsetpgrp(), therefore do not use
+        // posix_spawn.
+        let wants_terminal = job.group().wants_terminal();
+        !wants_terminal
+    }
 }
 
 fn internal_exec(vars: &EnvStack, is_repainting: bool, j: &Job, block_io: IoChain) {
@@ -1125,80 +1152,6 @@ fn exec_block_or_func_process(
     Ok(())
 }
 
-fn get_performer_for_builtin(p: &Process, j: &Job, io_chain: &IoChain) -> Box<ProcPerformer> {
-    assert!(p.is_builtin(), "Process must be a builtin");
-
-    // Determine if we have a "direct" redirection for stdin.
-    let mut stdin_is_directly_redirected = false;
-    if !p.is_first_in_job {
-        // We must have a pipe
-        stdin_is_directly_redirected = true;
-    } else {
-        // We are not a pipe. Check if there is a redirection local to the process
-        // that's not io_mode_t::close.
-        for redir in p.redirection_specs() {
-            if redir.fd == STDIN_FILENO && !redir.is_close() {
-                stdin_is_directly_redirected = true;
-                break;
-            }
-        }
-    }
-
-    // Pull out some fields which we want to copy. We don't want to store the process or job in the
-    // returned closure.
-    let job_group = j.group.clone();
-    let io_chain = io_chain.clone();
-
-    // Be careful to not capture p or j by value, as the intent is that this may be run on another
-    // thread.
-    let argv = p.argv().clone();
-    Box::new(
-        move |parser: &mut Parser,
-              output_stream: Option<&mut OutputStream>,
-              errput_stream: Option<&mut OutputStream>| {
-            let output_stream = output_stream.unwrap();
-            let errput_stream = errput_stream.unwrap();
-            let out_io = io_chain.io_for_fd(STDOUT_FILENO);
-            let err_io = io_chain.io_for_fd(STDERR_FILENO);
-
-            // Figure out what fd to use for the builtin's stdin.
-            let mut local_builtin_stdin = Some(BorrowedFdFile::stdin());
-            if let Some(inp) = io_chain.io_for_fd(STDIN_FILENO) {
-                // An fd of -1 is treated as closing stdin.
-                // Ignore fd redirections from an fd other than the
-                // standard ones. e.g. in source <&3 don't actually read from fd 3,
-                // which is internal to fish. We still respect this redirection in
-                // that we pass it on as a block IO to the code that source runs,
-                // and therefore this is not an error.
-                let fd = inp.source_fd();
-                let ignore_redirect = fd >= 3 && inp.io_mode() == IoMode::Fd;
-                if fd == -1 {
-                    local_builtin_stdin = None;
-                } else if !ignore_redirect {
-                    // Safety: the fd may in principal be closed, but this only panics on negative values.
-                    local_builtin_stdin = Some(unsafe { BorrowedFdFile::from_raw_fd(fd) });
-                }
-            }
-
-            // Populate our IoStreams. This is a bag of information for the builtin.
-            let mut streams = IoStreams::new(output_stream, errput_stream, &io_chain);
-            streams.job_group = job_group;
-            streams.stdin_file = local_builtin_stdin;
-            streams.stdin_is_directly_redirected = stdin_is_directly_redirected;
-            streams.out_is_redirected = out_io.is_some();
-            streams.err_is_redirected = err_io.is_some();
-            streams.out_is_piped = out_io.is_some_and(|io| io.io_mode() == IoMode::Pipe);
-            streams.err_is_piped = err_io.is_some_and(|io| io.io_mode() == IoMode::Pipe);
-
-            // Disallow nul bytes in the arguments, as they are not allowed in builtins.
-            let mut shim_argv: Vec<&wstr> =
-                argv.iter().map(|s| truncate_at_nul(s.as_ref())).collect();
-            // Execute the builtin.
-            builtin_run(parser, &mut shim_argv, &mut streams)
-        },
-    )
-}
-
 /// Executes a builtin "process".
 fn exec_builtin_process(
     parser: &mut Parser,
@@ -1213,8 +1166,56 @@ fn exec_builtin_process(
     let mut err =
         create_output_stream_for_builtin(STDERR_FILENO, io_chain, piped_output_needs_buffering);
 
-    let performer = get_performer_for_builtin(p, j, io_chain);
-    let status = performer(parser, Some(&mut out), Some(&mut err));
+    // Run the builtin synchronously, in place. Unlike block/function processes a
+    // builtin is never deferred to another thread, so there is no need to box a
+    // performer closure or deep-clone argv / the io chain (which showed up in the
+    // profile) -- borrow them directly.
+    let status = {
+        // Determine if we have a "direct" redirection for stdin.
+        let stdin_is_directly_redirected = if !p.is_first_in_job {
+            // We must have a pipe.
+            true
+        } else {
+            // Not a pipe: check for a process-local redirection that's not close.
+            p.redirection_specs()
+                .iter()
+                .any(|redir| redir.fd == STDIN_FILENO && !redir.is_close())
+        };
+
+        let out_io = io_chain.io_for_fd(STDOUT_FILENO);
+        let err_io = io_chain.io_for_fd(STDERR_FILENO);
+
+        // Figure out what fd to use for the builtin's stdin.
+        let mut local_builtin_stdin = Some(BorrowedFdFile::stdin());
+        if let Some(inp) = io_chain.io_for_fd(STDIN_FILENO) {
+            let fd = inp.source_fd();
+            // Ignore fd redirections from an fd other than the standard ones (e.g.
+            // `source <&3`); an fd of -1 closes stdin.
+            let ignore_redirect = fd >= 3 && inp.io_mode() == IoMode::Fd;
+            if fd == -1 {
+                local_builtin_stdin = None;
+            } else if !ignore_redirect {
+                // Safety: the fd may in principle be closed, but this only panics on
+                // negative values, which are excluded above.
+                local_builtin_stdin = Some(unsafe { BorrowedFdFile::from_raw_fd(fd) });
+            }
+        }
+
+        // Populate our IoStreams. This is a bag of information for the builtin.
+        let mut streams = IoStreams::new(&mut out, &mut err, io_chain);
+        streams.job_group = j.group.clone();
+        streams.stdin_file = local_builtin_stdin;
+        streams.stdin_is_directly_redirected = stdin_is_directly_redirected;
+        streams.out_is_redirected = out_io.is_some();
+        streams.err_is_redirected = err_io.is_some();
+        streams.out_is_piped = out_io.is_some_and(|io| io.io_mode() == IoMode::Pipe);
+        streams.err_is_piped = err_io.is_some_and(|io| io.io_mode() == IoMode::Pipe);
+
+        // Disallow nul bytes in the arguments, as they are not allowed in builtins.
+        let mut shim_argv: Vec<&wstr> =
+            p.argv().iter().map(|s| truncate_at_nul(s.as_ref())).collect();
+        builtin_run(parser, &mut shim_argv, &mut streams)
+    };
     p.status.set(status);
     handle_builtin_output(parser, j, p, io_chain, &out, &err);
     Ok(())

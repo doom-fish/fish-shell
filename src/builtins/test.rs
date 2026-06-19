@@ -11,12 +11,28 @@ mod test_expressions {
     use crate::err_raw;
     use crate::nix::isatty;
     use crate::wutil::{
-        self, file_id_for_path, lwstat, waccess, wcstod::wcstod, wcstoi, wcstoi_opts, wstat,
+        self, file_id_for_path, lwstat, waccess, wcstod::wcstod, wcstoi, wcstoi_opts, wfast_stat,
+        wstat,
     };
     use fish_fallback::fish_wcswidth;
     use std::collections::HashMap;
+    #[cfg(unix)]
     use std::os::unix::prelude::*;
+    #[cfg(windows)]
+    use osfd_win::prelude::*;
     use std::sync::LazyLock;
+
+    /// Resolve the POSIX file-type bits (`S_IFMT`) of `arg` via the Win32-backed
+    /// `nix::sys::stat`. Windows' `std` `FileType` cannot represent FIFOs,
+    /// sockets or character/block devices (and never recognises Cygwin/MSYS2
+    /// special files stored as `<path>.lnk`), so the `-p`/`-c`/`-b`/`-S`
+    /// predicates consult the runtime stat instead.
+    #[cfg(windows)]
+    fn posix_ifmt(arg: &wstr) -> Option<u32> {
+        nix::sys::stat::stat(fish_widestring::wcs2osstring(arg).as_os_str())
+            .ok()
+            .map(|st| st.st_mode & 0o170000)
+    }
 
     #[derive(Copy, Clone, PartialEq, Eq)]
     pub(super) enum Token {
@@ -911,41 +927,76 @@ mod test_expressions {
         match token {
             #[allow(clippy::unnecessary_cast)] // mode_t is u32 on many platforms, but not all
             UnaryToken::FileStat(stat_token) => {
-                let Ok(md) = wstat(arg) else {
-                    return false;
-                };
+                // On Windows, character/block/FIFO/socket types are invisible to
+                // `std`'s `FileType`, and a Cygwin/MSYS2 FIFO is stored on disk as
+                // a `<path>.lnk` shortcut that a plain `wstat` cannot even open.
+                // Resolve those four predicates through the Win32-backed runtime
+                // stat, which understands both device handles and `.lnk` magic.
+                #[cfg(windows)]
+                {
+                    let want = match stat_token {
+                        StatPredicate::b => Some(0o060000),
+                        StatPredicate::c => Some(0o020000),
+                        StatPredicate::p => Some(0o010000),
+                        StatPredicate::S => Some(0o140000),
+                        _ => None,
+                    };
+                    if let Some(want) = want {
+                        return posix_ifmt(arg) == Some(want);
+                    }
+                }
 
                 const S_ISUID: u32 = libc::S_ISUID as u32;
                 const S_ISGID: u32 = libc::S_ISGID as u32;
                 const S_ISVTX: u32 = libc::S_ISVTX as u32;
 
                 match stat_token {
-                    // "-b", for block special files
-                    StatPredicate::b => md.file_type().is_block_device(),
-                    // "-c", for character special files
-                    StatPredicate::c => md.file_type().is_char_device(),
+                    // Type / existence / size predicates carry no file identity,
+                    // so resolve them through the single-syscall attribute probe
+                    // (no handle open, no per-open AV scan) instead of `wstat`.
                     // "-d", for directories
-                    StatPredicate::d => md.file_type().is_dir(),
+                    StatPredicate::d => wfast_stat(arg).is_ok_and(|md| md.is_dir()),
                     // "-e", for files that exist
-                    StatPredicate::e => true,
+                    StatPredicate::e => wfast_stat(arg).is_ok(),
                     // "-f", for regular files
-                    StatPredicate::f => md.file_type().is_file(),
-                    // "-G", for check effective group ID
-                    StatPredicate::G => md.gid() == Gid::effective().as_raw(),
-                    // "-g", for set-group-id
-                    StatPredicate::g => md.permissions().mode() & S_ISGID != 0,
-                    // "-k", for sticky bit
-                    StatPredicate::k => md.permissions().mode() & S_ISVTX != 0,
-                    // "-O", for check effective user id
-                    StatPredicate::O => md.uid() == Uid::effective().as_raw(),
-                    // "-p", for FIFO
-                    StatPredicate::p => md.file_type().is_fifo(),
-                    // "-S", socket
-                    StatPredicate::S => md.file_type().is_socket(),
+                    StatPredicate::f => wfast_stat(arg).is_ok_and(|md| md.is_regular()),
                     // "-s", size greater than zero
-                    StatPredicate::s => md.len() > 0,
+                    StatPredicate::s => wfast_stat(arg).is_ok_and(|md| md.len() > 0),
+
+                    // The remaining predicates need the full `stat` (special
+                    // file types and the permission/ownership bits).
+                    // "-b", for block special files
+                    StatPredicate::b => {
+                        wstat(arg).is_ok_and(|md| md.file_type().is_block_device())
+                    }
+                    // "-c", for character special files
+                    StatPredicate::c => {
+                        wstat(arg).is_ok_and(|md| md.file_type().is_char_device())
+                    }
+                    // "-G", for check effective group ID
+                    StatPredicate::G => {
+                        wstat(arg).is_ok_and(|md| md.gid() == Gid::effective().as_raw())
+                    }
+                    // "-g", for set-group-id
+                    StatPredicate::g => {
+                        wstat(arg).is_ok_and(|md| md.permissions().mode() & S_ISGID != 0)
+                    }
+                    // "-k", for sticky bit
+                    StatPredicate::k => {
+                        wstat(arg).is_ok_and(|md| md.permissions().mode() & S_ISVTX != 0)
+                    }
+                    // "-O", for check effective user id
+                    StatPredicate::O => {
+                        wstat(arg).is_ok_and(|md| md.uid() == Uid::effective().as_raw())
+                    }
+                    // "-p", for FIFO
+                    StatPredicate::p => wstat(arg).is_ok_and(|md| md.file_type().is_fifo()),
+                    // "-S", socket
+                    StatPredicate::S => wstat(arg).is_ok_and(|md| md.file_type().is_socket()),
                     // "-u", whether file is setuid
-                    StatPredicate::u => md.permissions().mode() & S_ISUID != 0,
+                    StatPredicate::u => {
+                        wstat(arg).is_ok_and(|md| md.permissions().mode() & S_ISUID != 0)
+                    }
                 }
             }
             UnaryToken::FileType(file_type) => {

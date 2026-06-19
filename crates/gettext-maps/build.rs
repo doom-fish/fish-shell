@@ -66,10 +66,13 @@ fn embed_localizations(cache_dir: &Path) {
                 let cached_map_path = cache_dir.join(lang);
 
                 // Include the file containing the map for this language in the main generated file.
+                // Use forward slashes so the path is a valid Rust string literal: on Windows
+                // `Path::display()` yields backslashes, which `include!` would interpret as
+                // (invalid) string escape sequences.
                 writeln!(
                     &mut localization_map_file,
                     "include!(\"{}\");",
-                    cached_map_path.display()
+                    cached_map_path.display().to_string().replace('\\', "/")
                 )
                 .unwrap();
                 // Map from the language identifier to the map containing the localizations for this

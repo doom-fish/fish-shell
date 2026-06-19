@@ -19,34 +19,51 @@ use errno::{Errno, set_errno};
 use fish_util::{perror, write_to_fd};
 use fish_wcstringutil::join_strings;
 use fish_widestring::{
-    IntoCharIter, L, WExt as _, WString, bytes2wcstring, fish_reserved_codepoint, osstr2wcstring,
+    IntoCharIter, L, WExt as _, WString, bytes2wcstring, fish_reserved_codepoint,
     str2bytes_callback, wcs2osstring, wcs2zstring, wstr,
 };
+#[cfg(windows)]
+use fish_widestring::str2wcstring;
+#[cfg(not(windows))]
+use fish_widestring::osstr2wcstring;
 use nix::unistd::AccessFlags;
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use osfd_win::RawFd;
 use std::{
     ffi::OsStr,
     fs::{self, canonicalize},
     io,
-    os::unix::prelude::*,
 };
+#[cfg(unix)]
+use std::os::unix::prelude::*;
+#[cfg(windows)]
+use osfd_win::prelude::*;
 
 /// Wide character version of opendir(). Note that opendir() is guaranteed to set close-on-exec by
 /// POSIX (hooray).
 pub fn wopendir(name: &wstr) -> *mut libc::DIR {
+    // libc::opendir is the C runtime's narrow opendir; translate fish's POSIX path to the native
+    // Windows form so it can resolve `/c/...` directories (Cygwin/MSYS2 model).
+    #[cfg(windows)]
+    let tmp = {
+        let native = posix_rt::pathconv::posix_to_win(wcs2osstring(name));
+        wcs2zstring(&str2wcstring(native.to_string_lossy().as_ref()))
+    };
+    #[cfg(not(windows))]
     let tmp = wcs2zstring(name);
     unsafe { libc::opendir(tmp.as_ptr()) }
 }
 
 /// Wide character version of stat().
 pub fn wstat(file_name: &wstr) -> io::Result<fs::Metadata> {
-    let tmp = wcs2osstring(file_name);
-    fs::metadata(tmp)
+    fs::metadata(wcs2native_os(file_name))
 }
 
 /// Wide character version of lstat().
 pub fn lwstat(file_name: &wstr) -> io::Result<fs::Metadata> {
-    let tmp = wcs2osstring(file_name);
-    fs::symlink_metadata(tmp)
+    fs::symlink_metadata(wcs2native_os(file_name))
 }
 
 /// Cover over fstat().
@@ -57,14 +74,137 @@ pub fn fstat(fd: impl AsRawFd) -> io::Result<fs::Metadata> {
 
 /// Wide character version of access().
 pub fn waccess(file_name: &wstr, amode: AccessFlags) -> nix::Result<()> {
-    let tmp = wcs2osstring(file_name);
+    let tmp = wcs2native_os(file_name);
     nix::unistd::access(tmp.as_os_str(), amode)
+}
+
+/// File classification returned by [`wfast_stat`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileKind {
+    Dir,
+    Regular,
+    Other,
+}
+
+/// Lightweight metadata for hot type/existence checks that must not pay for
+/// file identity (highlighting, `test -f/-d/-e/-s`). See [`wfast_stat`].
+#[derive(Clone, Copy, Debug)]
+pub struct FastMeta {
+    kind: FileKind,
+    size: u64,
+}
+
+impl FastMeta {
+    /// Whether the path is a directory.
+    pub fn is_dir(&self) -> bool {
+        self.kind == FileKind::Dir
+    }
+    /// Whether the path is a regular file.
+    pub fn is_regular(&self) -> bool {
+        self.kind == FileKind::Regular
+    }
+    /// Size in bytes.
+    pub fn len(&self) -> u64 {
+        self.size
+    }
+}
+
+fn fastmeta_from_metadata(md: &fs::Metadata) -> FastMeta {
+    let ft = md.file_type();
+    let kind = if ft.is_dir() {
+        FileKind::Dir
+    } else if ft.is_file() {
+        FileKind::Regular
+    } else {
+        FileKind::Other
+    };
+    FastMeta {
+        kind,
+        size: md.len(),
+    }
+}
+
+/// Fast `stat`-like probe returning only the file *kind* and size, following
+/// symlinks like [`wstat`].
+///
+/// On Windows this skips the file-handle open (and the per-open antivirus /
+/// minifilter scan it incurs) for plain files and directories, querying
+/// attributes in a single syscall instead — measurably cheaper on the hot
+/// highlighting / `test` paths. Reparse points (symlinks/junctions) and **any**
+/// error fall back to the exact [`wstat`] path, so the observable result —
+/// including the precise `io::Error` callers branch on — is unchanged.
+pub fn wfast_stat(file_name: &wstr) -> io::Result<FastMeta> {
+    #[cfg(windows)]
+    {
+        let native = wcs2native_os(file_name);
+        if let Ok(attrs) = nix::sys::stat::attributes(native.as_os_str()) {
+            if !attrs.is_reparse {
+                // `attributes` only yields S_IFDIR / S_IFREG for non-reparse
+                // entries; anything else routes through the std fallback below.
+                let kind = if attrs.st_mode & 0o170000 == 0o040000 {
+                    FileKind::Dir
+                } else {
+                    FileKind::Regular
+                };
+                return Ok(FastMeta {
+                    kind,
+                    size: attrs.st_size,
+                });
+            }
+        }
+        // Reparse point or attribute-query error: defer to the exact std path,
+        // which follows symlinks and surfaces the precise error.
+        wstat(file_name).map(|md| fastmeta_from_metadata(&md))
+    }
+    #[cfg(not(windows))]
+    {
+        wstat(file_name).map(|md| fastmeta_from_metadata(&md))
+    }
 }
 
 /// Wide character version of unlink().
 pub fn wunlink(file_name: &wstr) -> io::Result<()> {
-    let tmp = wcs2osstring(file_name);
-    fs::remove_file(tmp)
+    fs::remove_file(wcs2native_os(file_name))
+}
+
+/// Convert a fish-internal POSIX path (`/c/Users/per`) to the OS-native form (`C:\Users\per`)
+/// for direct `std::fs`/`std::env` boundary calls. This is the Cygwin/MSYS2 std-boundary
+/// translation; on POSIX platforms it is the identity narrow conversion.
+#[cfg(windows)]
+fn wcs2native_os(path: &wstr) -> std::ffi::OsString {
+    posix_rt::pathconv::posix_to_win(wcs2osstring(path)).into_os_string()
+}
+
+#[cfg(not(windows))]
+fn wcs2native_os(path: &wstr) -> std::ffi::OsString {
+    wcs2osstring(path)
+}
+
+/// Translate a *native* Windows path that a user typed (`C:/foo`, `C:\foo`, `\\server\share`)
+/// into fish's POSIX view (`/c/foo`, `/unc/server/share`). Already-POSIX and relative inputs
+/// are returned unchanged. This is the user-input boundary for the Cygwin/MSYS2 path model:
+/// fish's path logic (CDPATH, `path_apply_working_directory`, normalization) is purely POSIX, so
+/// native input must be converted before it reaches that logic, otherwise a drive-qualified path
+/// like `C:/foo` (which has no leading `/`) is misread as relative to `$PWD`.
+#[cfg(windows)]
+pub fn native_input_to_posix(p: &wstr) -> WString {
+    let cs = p.as_char_slice();
+    let drive_abs = cs.len() >= 3
+        && cs[1] == ':'
+        && cs[0].is_ascii_alphabetic()
+        && (cs[2] == '/' || cs[2] == '\\');
+    let unc = cs.len() >= 2 && cs[0] == '\\' && cs[1] == '\\';
+    if drive_abs || unc {
+        WString::from_str(&posix_rt::pathconv::win_to_posix(p.to_string()))
+    } else {
+        p.to_owned()
+    }
+}
+
+/// On non-Windows targets paths are already POSIX, so this is the identity.
+#[cfg(not(windows))]
+pub fn native_input_to_posix(p: &wstr) -> WString {
+    p.to_owned()
 }
 
 pub fn perror_nix(s: &str, e: nix::errno::Errno) {
@@ -76,7 +216,17 @@ pub fn perror_io(s: &str, e: &io::Error) {
 }
 
 /// Wide character version of getcwd().
+///
+/// The kernel cwd is a native Windows path (`C:\Users\per`); translate it into fish's POSIX view
+/// (`/c/Users/per`) so `$PWD` and every path computation stays POSIX (Cygwin/MSYS2 model).
 pub fn wgetcwd() -> WString {
+    #[cfg(windows)]
+    {
+        // fishbowl tracks a logical cwd (posix-rt) rather than the Win32 process
+        // cwd; surface it in fish's POSIX view.
+        return str2wcstring(&posix_rt::pathconv::win_to_posix_str(&posix_rt::current_dir()));
+    }
+    #[cfg(not(windows))]
     match std::env::current_dir() {
         Ok(cwd) => osstr2wcstring(cwd),
         Err(e) => {
@@ -90,12 +240,44 @@ pub fn wgetcwd() -> WString {
 pub fn wreadlink(file_name: &wstr) -> Option<WString> {
     let _ = lwstat(file_name).ok()?;
     match fs::read_link(wcs2osstring(file_name)) {
+        // The link target is a native Windows path; translate it back to fish's POSIX view.
+        #[cfg(windows)]
+        Ok(target) => Some(str2wcstring(posix_rt::pathconv::win_to_posix(target))),
+        #[cfg(not(windows))]
         Ok(target) => Some(osstr2wcstring(target)),
         Err(e) => {
             perror_io("readlink", &e);
             None
         }
     }
+}
+
+/// `canonicalize` in fish's POSIX path domain.
+///
+/// fish feeds POSIX paths (`/c/Windows`) to `realpath`, but `std::fs::canonicalize` is a native
+/// Windows call. Translate POSIX -> native, canonicalize, strip the `\\?\` verbatim prefix that
+/// Windows returns, then translate the canonical native path back to POSIX.
+#[cfg(windows)]
+fn realpath_canonicalize<P: AsRef<OsStr>>(path: P) -> io::Result<std::path::PathBuf> {
+    let input = path.as_ref().to_string_lossy();
+    let native = posix_rt::pathconv::posix_to_win(path.as_ref());
+    let canon = canonicalize(native)?;
+    let mut posix = posix_rt::pathconv::win_to_posix(&canon);
+    if input == "/tmp" || input.starts_with("/tmp/") {
+        let tmp_posix = posix_rt::pathconv::win_to_posix(posix_rt::pathconv::tmp_dir());
+        if posix == tmp_posix {
+            posix = "/tmp".to_string();
+        } else if let Some(rest) = posix.strip_prefix(&(tmp_posix + "/")) {
+            posix = format!("/tmp/{rest}");
+        }
+    }
+    Ok(std::path::PathBuf::from(posix))
+}
+
+/// On POSIX platforms this is just `std::fs::canonicalize`.
+#[cfg(not(windows))]
+fn realpath_canonicalize<P: AsRef<OsStr>>(path: P) -> io::Result<std::path::PathBuf> {
+    canonicalize(path.as_ref())
 }
 
 /// Wide character realpath. The last path component does not need to be valid. If an error occurs,
@@ -106,6 +288,16 @@ pub fn wrealpath(pathname: &wstr) -> Option<WString> {
         return None;
     }
 
+    // fish resolves paths in its POSIX domain (`/c/...`), but an argument may arrive in
+    // native Windows form (`C:\...`, `C:/...`, or a mixed-separator path such as
+    // `C:/dir\file` produced by Windows tooling). Normalize it to POSIX first so the
+    // canonicalization below and every downstream caller see a consistent `/c/`-path;
+    // `win_to_posix` is idempotent for already-POSIX input. Identity off-Windows.
+    #[cfg(windows)]
+    let pathname_owned = str2wcstring(posix_rt::pathconv::win_to_posix(wcs2osstring(pathname)));
+    #[cfg(windows)]
+    let pathname: &wstr = &pathname_owned;
+
     let mut narrow_path: Vec<u8> = wcs2zstring(pathname).into();
 
     // Strip trailing slashes. This is treats "/a//" as equivalent to "/a" if /a is a non-directory.
@@ -113,7 +305,26 @@ pub fn wrealpath(pathname: &wstr) -> Option<WString> {
         narrow_path.pop();
     }
 
-    let narrow_res = canonicalize(OsStr::from_bytes(&narrow_path));
+    // The POSIX virtual root `/` (Cygwin/MSYS2 model) is its own canonical form: `realpath /`
+    // is `/`, not the system drive it backs onto. Windows canonicalization would resolve `/` and
+    // any `..` that climbs to it through `C:\` and surface the system drive (`/c/`) instead of the
+    // virtual root. `..` at the root never escapes it (`/..` == `/`), so collapse those segments
+    // lexically here, then short-circuit a bare virtual root. Drive roots like `/c` and ordinary
+    // paths keep flowing through the real canonicalization below.
+    #[cfg(windows)]
+    {
+        while narrow_path.starts_with(b"/../") {
+            narrow_path.drain(0..3);
+        }
+        if narrow_path == b"/.." {
+            narrow_path.truncate(1);
+        }
+        if narrow_path == b"/" {
+            return Some(WString::from_str("/"));
+        }
+    }
+
+    let narrow_res = realpath_canonicalize(OsStr::from_bytes(&narrow_path));
 
     let real_path = if let Ok(result) = narrow_res {
         result.into_os_string().into_vec()
@@ -129,13 +340,14 @@ pub fn wrealpath(pathname: &wstr) -> Option<WString> {
             // Only call realpath() on the portion up to the last component.
             let narrow_res = if let Some(pathsep_idx) = pathsep_idx {
                 // Only call realpath() on the portion up to the last component.
-                canonicalize(OsStr::from_bytes(&narrow_path[0..pathsep_idx]))
+                realpath_canonicalize(OsStr::from_bytes(&narrow_path[0..pathsep_idx]))
             } else {
                 // If there is no "/", this is a file in $PWD, so give the realpath to that.
-                canonicalize(".")
+                realpath_canonicalize(".")
             };
 
             let Ok(narrow_result) = narrow_res else {
+                set_errno(Errno(libc::ENOENT));
                 return None;
             };
 

@@ -2,7 +2,10 @@ use crate::common::{BUILD_DIR, get_program_name};
 use crate::{flog, flogf};
 use fish_build_helper::workspace_root;
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
+#[cfg(windows)]
+use osfd_win::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -26,7 +29,7 @@ impl ConfigPaths {
         flog!(
             config,
             match exec_path {
-                FishPath::Absolute(path) => format!("executable path: {}", path.display()),
+                FishPath::Absolute(path) => format!("executable path: {}", posix_display_exec(path)),
                 FishPath::LookUpInPath => format!("executable path: {}", get_program_name()),
             }
         );
@@ -34,7 +37,7 @@ impl ConfigPaths {
         flogf!(
             config,
             "paths.sysconf: %s",
-            paths.sysconf.display().to_string()
+            posix_display(&paths.sysconf)
         );
         macro_rules! log_optional_path {
             ($field:ident) => {
@@ -45,7 +48,7 @@ impl ConfigPaths {
                     paths
                         .$field
                         .as_ref()
-                        .map(|x| x.display().to_string())
+                        .map(|x| posix_display(x))
                         .unwrap_or("|not found|".to_string()),
                 );
             };
@@ -86,6 +89,13 @@ impl ConfigPaths {
                         );
                         return default_layout(p.parent());
                     };
+                    // `Path::canonicalize` returns an extended-length (`\\?\`) verbatim path on
+                    // Windows, but BUILD_DIR / CARGO_MANIFEST_DIR are stored as *plain* canonical
+                    // paths (build.rs strips the prefix). Strip it here too so the
+                    // `starts_with(BUILD_DIR)` build-tree detection below matches, instead of
+                    // always falling through to the default (installed) paths.
+                    #[cfg(windows)]
+                    let exec_path = strip_verbatim_prefix(exec_path);
                     exec_path
                 }
                 LookUpInPath => {
@@ -135,7 +145,7 @@ impl ConfigPaths {
                 config,
                 format!(
                     "Running out of build directory, using paths relative to $CARGO_MANIFEST_DIR ({})",
-                    workspace_root.display()
+                    posix_display(&workspace_root)
                 ),
             );
             let doc_join = |dir| {
@@ -161,9 +171,48 @@ impl ConfigPaths {
     }
 }
 
+/// Strip Windows' extended-length (`\\?\`) verbatim prefix from a canonicalized path so it can be
+/// compared, as a plain path, against the plain canonical BUILD_DIR / CARGO_MANIFEST_DIR baked in
+/// at build time (see build.rs `canonicalize_plain`).
+#[cfg(windows)]
+fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    match p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(stripped) => PathBuf::from(stripped),
+        None => p,
+    }
+}
+
 pub enum FishPath {
     Absolute(PathBuf),
     LookUpInPath,
+}
+
+/// Display a native filesystem path in fish's POSIX path domain (`/c/...`) for `config:`
+/// diagnostics, so reported paths match the POSIX paths fish uses everywhere else. The stored
+/// `PathBuf`s stay native (they feed `canonicalize`). On non-Windows this is the plain display.
+#[cfg(windows)]
+fn posix_display(path: &Path) -> String {
+    posix_rt::pathconv::win_to_posix(path.as_os_str())
+}
+#[cfg(not(windows))]
+fn posix_display(path: &Path) -> String {
+    path.display().to_string()
+}
+
+/// Like [`posix_display`] but for the fish executable itself: the on-disk name is `fish.exe`,
+/// yet fish's POSIX view of its own path omits the synthetic Windows `.exe` extension so
+/// diagnostics read `.../fish`.
+#[cfg(windows)]
+fn posix_display_exec(path: &Path) -> String {
+    let s = posix_rt::pathconv::win_to_posix(path.as_os_str());
+    match s.get(s.len().saturating_sub(4)..) {
+        Some(ext) if ext.eq_ignore_ascii_case(".exe") => s[..s.len() - 4].to_string(),
+        _ => s,
+    }
+}
+#[cfg(not(windows))]
+fn posix_display_exec(path: &Path) -> String {
+    path.display().to_string()
 }
 
 static FISH_PATH: LazyLock<FishPath> = LazyLock::new(compute_fish_path);

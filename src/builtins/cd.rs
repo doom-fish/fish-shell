@@ -194,6 +194,12 @@ pub fn cd(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> B
         }
     };
 
+    // Accept native Windows path input (`C:/Windows`, `\\server\share`) by translating it into
+    // fish's POSIX view before any CDPATH logic, which is purely POSIX (Cygwin/MSYS2 model).
+    // Bare names and already-POSIX paths are left untouched so relative cd and CDPATH still work.
+    let native_cd_buf = crate::wutil::native_input_to_posix(dir_in);
+    let dir_in: &wstr = &native_cd_buf;
+
     // Stop `cd ""` from crashing
     if dir_in.is_empty() {
         let mut err = err_fmt!("Empty directory '%s' does not exist", dir_in).cmd(cmd);

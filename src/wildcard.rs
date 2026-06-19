@@ -15,11 +15,14 @@ use fish_fallback::wcscasecmp;
 use fish_feature_flags::{FeatureFlag, feature_test};
 use fish_wcstringutil::{
     CaseSensitivity, string_fuzzy_match_string, string_suffixes_string_case_insensitive,
-    strip_executable_suffix,
 };
 use fish_widestring::{ANY_CHAR, ANY_STRING, ANY_STRING_RECURSIVE};
 use nix::unistd::AccessFlags;
-use std::{cell::LazyCell, cmp::Ordering, collections::HashSet, os::unix::fs::MetadataExt as _};
+use std::{cell::LazyCell, cmp::Ordering, collections::HashSet};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+#[cfg(windows)]
+use osfd_win::fs::MetadataExt as _;
 
 localizable_consts!(
     COMPLETE_EXEC_DESC "command"
@@ -307,6 +310,14 @@ fn file_get_desc(
     }
 }
 
+/// Like [`strip_executable_suffix`] but also active on native Windows, where the `cygwin` cfg is
+/// not set yet `.exe` is still the executable extension that should be hidden in completions.
+fn strip_dot_exe_suffix(path: &wstr) -> Option<&wstr> {
+    const DOT_EXE: &wstr = L!(".exe");
+    ((cfg!(cygwin) || cfg!(windows)) && string_suffixes_string_case_insensitive(DOT_EXE, path))
+        .then(|| &path[..path.len() - DOT_EXE.len()])
+}
+
 /// Test if the given file is an executable (if executables_only) or directory (if
 /// directories_only). If it matches, call wildcard_complete() with some description that we make
 /// up. Note that the filename came from a readdir() call, so we know it exists.
@@ -368,17 +379,27 @@ fn wildcard_test_flags_then_complete(
     // For executables on Cygwin, prefer the name without the .exe, to match
     // better with Unix names, but only if there isn't also a file without that
     // extension and the user hasn't started to type the extension
-    if let Some(filepath_stripped) = strip_executable_suffix(filepath) {
+    if let Some(filepath_stripped) = strip_dot_exe_suffix(filepath) {
         let stripped_filename_len = filename.len() - (filepath.len() - filepath_stripped.len());
         if wc.len() <= stripped_filename_len && *is_executable {
-            let stat_stripped = lwstat(filepath_stripped).map(|stat| (stat.dev(), stat.ino()));
-            let stat = filepath_stat.as_ref().map(|stat| (stat.dev(), stat.ino()));
-
-            // TODO(MSRV>=1.88): feature(let_chains)
-            //   if let Ok(stat_stripped) = stat_stripped
-            //       && let Ok(stat) = stat
-            //       && stat_stripped == stat
-            if stat_stripped.is_ok() && stat.is_ok() && stat_stripped.unwrap() == stat.unwrap() {
+            let do_strip = if cfg!(windows) {
+                // Native Windows has no Cygwin-style `.exe` auto-resolution, so the bare name and
+                // the `.exe` file are always distinct files. Only strip `.exe` when there is no
+                // conflicting bare-name file. A cheap existence probe (`GetFileAttributesW` via
+                // `waccess(F_OK)`) answers that without opening the file the way `lstat` would —
+                // and the dev/ino comparison the Cygwin branch needs does not apply here. This runs
+                // once per `.exe` completion candidate, so avoiding two file-opening `lstat`s
+                // materially speeds command completion in large `$PATH`s.
+                waccess(filepath_stripped, AccessFlags::F_OK).is_err()
+            } else {
+                // Cygwin: the bare name resolves to the same inode as the `.exe` file.
+                let stat_stripped = lwstat(filepath_stripped).map(|stat| (stat.dev(), stat.ino()));
+                let stat = filepath_stat.as_ref().map(|stat| (stat.dev(), stat.ino()));
+                stat_stripped.is_ok()
+                    && stat.is_ok()
+                    && stat_stripped.as_ref().unwrap() == stat.as_ref().unwrap()
+            };
+            if do_strip {
                 filename = &filename[0..filename.len() - 4];
             }
         }
@@ -746,6 +767,19 @@ mod expander {
                 }
 
                 let Some(dev_inode) = entry.dev_inode() else {
+                    // Some platforms cannot provide a (device, inode) identity for a
+                    // directory entry (notably native Windows, where `fstatat` is
+                    // unavailable and readdir reports no inode). Without it we cannot
+                    // track visited directories to break symlink loops. Fall back on the
+                    // d_type information: an entry we know is not a symlink cannot form a
+                    // loop, so descend into it without loop protection. If it might be a
+                    // link, skip it rather than risk unbounded recursion.
+                    if entry.is_possible_link() == Some(false) {
+                        let full_path: WString =
+                            base_dir.to_owned() + entry.name.as_utfstr() + L!("/");
+                        let prefix: WString = prefix.to_owned() + wc_segment + L!("/");
+                        self.expand(&full_path, wc_remainder, &prefix, info);
+                    }
                     continue;
                 };
 

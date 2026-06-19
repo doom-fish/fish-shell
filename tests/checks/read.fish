@@ -478,7 +478,7 @@ set -S tokens
 # CHECK: $tokens[3]: |bar|
 echo 'foo "&" bar' | read -al --tokenize --tokenize-raw tokens
 # CHECKERR: read: invalid option combination, --tokenize and --tokenize-raw are mutually exclusive
-# CHECKERR: {{.*}}checks/read.fish (line {{\d+}}):
+# CHECKERR: {{.*}}read.fish (line {{\d+}}):
 # CHECKERR: echo 'foo "&" bar' | read -al --tokenize --tokenize-raw tokens
 # CHECKERR: ^
 # CHECKERR: (Type 'help read' for related documentation)
@@ -498,7 +498,7 @@ printf \xff | { read invalid_utf8; set -S invalid_utf8 }
 
 echo foo | read -l -p "echo little-p" -P big-P var
 # CHECKERR: read: Options -p and -P cannot be used together
-# CHECKERR: {{.*}}checks/read.fish (line {{\d+}}):
+# CHECKERR: {{.*}}read.fish (line {{\d+}}):
 # CHECKERR: echo foo | read -l -p "echo little-p" -P big-P var
 # CHECKERR: ^
 # CHECKERR: (Type 'help read' for related documentation)
@@ -514,14 +514,14 @@ echo foo | read -L --tokenize-raw
 
 echo foo | read -lxu var
 # CHECKERR: read: cannot both export and unexport
-# CHECKERR: {{.*}}checks/read.fish (line {{\d+}}):
+# CHECKERR: {{.*}}read.fish (line {{\d+}}):
 # CHECKERR: echo foo | read -lxu var
 # CHECKERR: ^
 # CHECKERR: (Type 'help read' for related documentation)
 
 echo foo | read -lf var
 # CHECKERR: read: scope can be only one of: universal function global local
-# CHECKERR: {{.*}}checks/read.fish (line {{\d+}}):
+# CHECKERR: {{.*}}read.fish (line {{\d+}}):
 # CHECKERR: echo foo | read -lf var
 # CHECKERR: ^
 # CHECKERR: (Type 'help read' for related documentation)

@@ -574,7 +574,7 @@ $fish -c 'echo f[oo # not valid, no matching ]'
 for PWD in foo bar
     true
 end
-# CHECKERR: {{.*}}/basic.fish (line {{\d+}}): for: PWD: cannot overwrite read-only variable
+# CHECKERR: {{.*}}basic.fish (line {{\d+}}): for: PWD: cannot overwrite read-only variable
 # CHECKERR: for PWD in foo bar
 # CHECKERR:     ^~^
 # XXX FIXME carat should point at PWD

@@ -8,7 +8,7 @@ use crate::{
     path::path_apply_working_directory,
     redirection::RedirectionMode,
     threads::assert_is_background_thread,
-    wutil::{dir_iter::DirIter, fish_wcstoi, normalize_path, waccess, wbasename, wdirname, wstat},
+    wutil::{dir_iter::DirIter, fish_wcstoi, normalize_path, waccess, wbasename, wdirname, wfast_stat},
 };
 use fish_common::{UnescapeFlags, UnescapeStringStyle, unescape_string};
 use fish_wcstringutil::{
@@ -21,10 +21,11 @@ use fish_widestring::{
 };
 use libc::PATH_MAX;
 use nix::unistd::AccessFlags;
-use std::{
-    collections::{HashMap, HashSet},
-    os::fd::RawFd,
-};
+use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use osfd_win::RawFd;
 
 // This is used only internally to this file, and is exposed only for testing.
 #[derive(Clone, Copy, Default)]
@@ -160,7 +161,7 @@ impl<'src, 'opctx> FileTester<'src, 'opctx> {
                 // Note we color "try_input" files as errors if they are invalid,
                 // even though it's possible to execute these (replaced via /dev/null).
                 if waccess(&target_path, AccessFlags::R_OK).is_ok()
-                    && wstat(&target_path).is_ok_and(|md| !md.file_type().is_dir())
+                    && wfast_stat(&target_path).is_ok_and(|md| !md.is_dir())
                 {
                     Ok(IsFile(true))
                 } else {
@@ -177,12 +178,12 @@ impl<'src, 'opctx> FileTester<'src, 'opctx> {
                 // creating it). access() returns failure if the file does not exist.
                 let file_exists;
                 let file_is_writable;
-                match wstat(&target_path) {
+                match wfast_stat(&target_path) {
                     Ok(md) => {
                         // No err. We can write to it if it's not a directory and we have
                         // permission.
                         file_exists = true;
-                        file_is_writable = !md.file_type().is_dir()
+                        file_is_writable = !md.is_dir()
                             && waccess(&target_path, AccessFlags::W_OK).is_ok();
                     }
                     Err(err) => {
@@ -302,8 +303,8 @@ pub fn is_potential_path(
         // 2. If the cursor is not at the argument, it means the user is definitely not typing it,
         //    so we can skip the prefix-match.
         if must_be_full_dir || !at_cursor {
-            if let Ok(md) = wstat(&abs_path) {
-                if !at_cursor || md.file_type().is_dir() {
+            if let Ok(md) = wfast_stat(&abs_path) {
+                if !at_cursor || md.is_dir() {
                     return true;
                 }
             }
@@ -437,9 +438,12 @@ mod tests {
     use fish_widestring::osstr2wcstring;
     use std::{
         fs::{self, File, Permissions, create_dir_all},
-        os::unix::fs::PermissionsExt as _,
         path::PathBuf,
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(windows)]
+    use osfd_win::fs::PermissionsExt as _;
 
     fn temp_dir() -> TempDir {
         fish_tempfile::new_dir().unwrap()

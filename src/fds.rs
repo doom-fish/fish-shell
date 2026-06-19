@@ -10,11 +10,15 @@ use std::{
     io,
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
-    os::{
-        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
-        unix::prelude::*,
-    },
 };
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(windows)]
+use osfd_win::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::prelude::*;
+#[cfg(windows)]
+use osfd_win::prelude::*;
 
 localizable_consts!(
     pub PIPE_ERROR
@@ -318,7 +322,10 @@ mod tests {
     use super::{BorrowedFdFile, FIRST_HIGH_FD, make_autoclose_pipes};
     use crate::tests::prelude::*;
     use libc::{F_GETFD, FD_CLOEXEC};
+    #[cfg(unix)]
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    #[cfg(windows)]
+    use osfd_win::{AsRawFd as _, FromRawFd as _};
 
     #[test]
     #[serial]

@@ -7,6 +7,7 @@ use crate::{
     common::{PROGRAM_NAME, get_program_name},
     env::{EnvStack, Environment as _, env_init},
     err_fmt, err_str,
+    fds::wopen_cloexec,
     global_safety::RelaxedAtomicBool,
     highlight::{HighlightRole, HighlightSpec, colorize, highlight_shell},
     locale::set_libc_locales,
@@ -22,16 +23,15 @@ use crate::{
     wutil::fish_iswalnum,
 };
 use assert_matches::assert_matches;
+use nix::fcntl::OFlag;
+use nix::sys::stat::Mode;
 use fish_common::{ReadExt as _, UnescapeFlags, UnescapeStringStyle, unescape_string};
 use fish_wcstringutil::count_preceding_backslashes;
 use fish_wgetopt::{ArgType, WGetopter, WOption, wopt};
 use fish_widestring::{INTERNAL_SEPARATOR, bytes2wcstring, osstr2wcstring, wcs2bytes};
 use std::{
-    ffi::OsStr,
     fmt::Write as _,
-    fs,
     io::{Read, Write as _},
-    os::unix::ffi::OsStrExt as _,
 };
 
 /// Note: this got somewhat more complicated after introducing the new AST, because that AST no
@@ -1075,7 +1075,7 @@ fn do_indent(
             src = bytes2wcstring(&buf);
         } else {
             let arg = args[i];
-            match fs::File::open(OsStr::from_bytes(&wcs2bytes(arg))) {
+            match wopen_cloexec(arg, OFlag::O_RDONLY, Mode::empty()) {
                 Ok(file) => {
                     match read_file(file) {
                         Ok(s) => src = s,
@@ -1084,7 +1084,13 @@ fn do_indent(
                     output_location = arg;
                 }
                 Err(err) => {
-                    err_fmt!("Opening \"%s\" failed: %s", arg, err.to_string()).finish(streams);
+                    err_fmt!(
+                        "Opening \"%s\" failed: %s (os error %d)",
+                        arg,
+                        err.desc(),
+                        err as i32
+                    )
+                    .finish(streams);
                     return Err(STATUS_CMD_ERROR);
                 }
             }
@@ -1156,15 +1162,20 @@ fn do_indent(
             }
             OutputType::File => {
                 if output_wtext != src {
-                    match fs::File::create(OsStr::from_bytes(&wcs2bytes(output_location))) {
+                    match wopen_cloexec(
+                        output_location,
+                        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC,
+                        Mode::from_bits_truncate(0o666),
+                    ) {
                         Ok(mut file) => {
                             let _ = file.write_all(&wcs2bytes(&output_wtext));
                         }
                         Err(err) => {
                             err_fmt!(
-                                "Opening \"%s\" failed: %s",
+                                "Opening \"%s\" failed: %s (os error %d)",
                                 output_location,
-                                err.to_string()
+                                err.desc(),
+                                err as i32
                             )
                             .finish(streams);
                             return Err(STATUS_CMD_ERROR);

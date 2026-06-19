@@ -627,26 +627,26 @@ set --show var5
 
 set -a
 # CHECKERR: set: expected >= 1 arguments; got 0
-# CHECKERR: {{.*}}checks/set.fish (line {{\d+}}):
+# CHECKERR: {{.*}}set.fish (line {{\d+}}):
 # CHECKERR: set -a
 # CHECKERR: ^
 # CHECKERR: (Type 'help set' for related documentation)
 set -p
 # CHECKERR: set: expected >= 1 arguments; got 0
-# CHECKERR: {{.*}}checks/set.fish (line {{\d+}}):
+# CHECKERR: {{.*}}set.fish (line {{\d+}}):
 # CHECKERR: set -p
 # CHECKERR: ^
 # CHECKERR: (Type 'help set' for related documentation)
 
 set -a foo[1]
 # CHECKERR: set: Cannot use --append or --prepend when assigning to a slice
-# CHECKERR: {{.*}}checks/set.fish (line {{\d+}}):
+# CHECKERR: {{.*}}set.fish (line {{\d+}}):
 # CHECKERR: set -a foo[1]
 # CHECKERR: ^
 # CHECKERR: (Type 'help set' for related documentation)
 set -p foo[1]
 # CHECKERR: set: Cannot use --append or --prepend when assigning to a slice
-# CHECKERR: {{.*}}checks/set.fish (line {{\d+}}):
+# CHECKERR: {{.*}}set.fish (line {{\d+}}):
 # CHECKERR: set -p foo[1]
 # CHECKERR: ^
 # CHECKERR: (Type 'help set' for related documentation)
@@ -993,14 +993,14 @@ end
 
 set -e undefined[x..]
 # CHECKERR: set: Invalid index starting at 'x..]'
-# CHECKERR: {{.*}}checks/set.fish (line {{\d+}}):
+# CHECKERR: {{.*}}set.fish (line {{\d+}}):
 # CHECKERR: set -e undefined[x..]
 # CHECKERR: ^
 # CHECKERR: (Type 'help set' for related documentation)
 
 set -e undefined[..y]
 # CHECKERR: set: Invalid index starting at 'y]'
-# CHECKERR: {{.*}}checks/set.fish (line {{\d+}}):
+# CHECKERR: {{.*}}set.fish (line {{\d+}}):
 # CHECKERR: set -e undefined[..y]
 # CHECKERR: ^
 # CHECKERR: (Type 'help set' for related documentation)

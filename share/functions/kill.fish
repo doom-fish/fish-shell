@@ -1,9 +1,8 @@
 # localization: tier1
-if command -q kill
-    # Only define this if something to wrap exists
-    # this allows a nice "command not found" error to be triggered.
-    function kill
-        set -l args (__fish_expand_pid_args $argv)
-        and command kill $args
-    end
+function kill --description 'Send a signal to a process'
+    # Expand %n job specifiers to process ids, then hand off to the `kill` builtin which
+    # delivers the signal natively (no external kill(1), which cannot address native
+    # Windows process ids).
+    set -l args (__fish_expand_pid_args $argv)
+    and builtin kill $args
 end

@@ -1,6 +1,9 @@
 function cygwin_nosymlinks --description \
     "Return 0 if Cygwin fakes symlinks, return 1 otherwise"
 
+    __fish_cygwin_noacl ./
+    and return 0
+
     switch (__fish_uname)
         case "CYGWIN*"
             # Cygwin has various ways of creating symlinks but they should

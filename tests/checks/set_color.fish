@@ -36,11 +36,11 @@ string escape (set_color --background=reset)
 
 string escape (set_color --bold=red)
 # CHECKERR: set_color: --bold=red: option does not take an argument
-#CHECKERR: {{.*}}checks/set_color.fish (line {{\d+}}):
+#CHECKERR: {{.*}}set_color.fish (line {{\d+}}):
 #CHECKERR: set_color --bold=red
 #CHECKERR: ^
 #CHECKERR: in command substitution
-#CHECKERR: called on line {{\d+}} of file {{.*}}checks/set_color.fish
+#CHECKERR: called on line {{\d+}} of file {{.*}}set_color.fish
 #CHECKERR: (Type 'help set_color' for related documentation)
 
 string escape (set_color --strikethrough red --background=normal)
@@ -141,7 +141,7 @@ string escape (set_color --reset f00 --background=00f --underline-color=0f0 --bo
 
 set_color --unknown-opt
 # CHECKERR: set_color: --unknown-opt: unknown option
-# CHECKERR: {{.*}}checks/set_color.fish (line {{\d+}}):
+# CHECKERR: {{.*}}set_color.fish (line {{\d+}}):
 # CHECKERR: set_color --unknown-opt
 # CHECKERR: ^
 # CHECKERR: (Type 'help set_color' for related documentation)

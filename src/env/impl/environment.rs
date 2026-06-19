@@ -44,7 +44,19 @@ pub fn colon_split<T: AsRef<wstr>>(val: &[T]) -> Vec<WString> {
 
 /// Return true if a variable should become a path variable by default. See #436.
 fn variable_should_auto_pathvar(name: &wstr) -> bool {
-    name.ends_with("PATH") || name == "LANGUAGE"
+    #[cfg(windows)]
+    {
+        // Windows environment variable names are case-insensitive, so `Path` (the name Windows
+        // actually exposes) must be recognized as a path variable just like `PATH`. Compare
+        // case-insensitively so the inherited value is split on the path separator instead of
+        // being kept as one giant `;`-joined element.
+        let upper = name.to_uppercase();
+        upper.ends_with("PATH") || upper == "LANGUAGE"
+    }
+    #[cfg(not(windows))]
+    {
+        name.ends_with("PATH") || name == "LANGUAGE"
+    }
 }
 
 /// We cache our null-terminated export list. However an exported variable may change for lots of
@@ -1094,6 +1106,7 @@ mod tests {
     use super::colon_split;
     use crate::prelude::*;
 
+    #[cfg(not(windows))]
     #[test]
     fn test_colon_split() {
         assert_eq!(colon_split(&[L!("foo")]), &[L!("foo")]);
@@ -1113,5 +1126,37 @@ mod tests {
             colon_split(&[L!("1:"), L!("2:"), L!(":3:")]),
             &[L!("1"), L!(""), L!("2"), L!(""), L!(""), L!("3"), L!("")]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_colon_split_windows() {
+        // On Windows the path separator is `;`; a `;`-joined PATH must split into its entries
+        // (previously a multi-entry PATH was collapsed to a single element).
+        assert_eq!(
+            colon_split(&[L!("C:\\a;C:\\b;C:\\c")]),
+            &[L!("C:\\a"), L!("C:\\b"), L!("C:\\c")]
+        );
+        // A drive-letter colon must NOT split (using `:` here would shred `C:\...`).
+        assert_eq!(colon_split(&[L!("C:\\a")]), &[L!("C:\\a")]);
+        assert_eq!(
+            colon_split(&[L!("C:\\a;C:\\b"), L!("C:\\c")]),
+            &[L!("C:\\a"), L!("C:\\b"), L!("C:\\c")]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_auto_pathvar_case_insensitive() {
+        // Windows env var names are case-insensitive; `Path` must be treated as a path variable
+        // just like `PATH` so the inherited value gets split instead of staying one element.
+        use super::variable_should_auto_pathvar;
+        assert!(variable_should_auto_pathvar(L!("PATH")));
+        assert!(variable_should_auto_pathvar(L!("Path")));
+        assert!(variable_should_auto_pathvar(L!("path")));
+        assert!(variable_should_auto_pathvar(L!("CDPATH")));
+        assert!(variable_should_auto_pathvar(L!("CDPath")));
+        assert!(!variable_should_auto_pathvar(L!("HOME")));
+        assert!(!variable_should_auto_pathvar(L!("USERPROFILE")));
     }
 }

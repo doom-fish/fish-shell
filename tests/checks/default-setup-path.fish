@@ -1,8 +1,5 @@
 #RUN: fish=%fish %fish %s
 
-# Cygwin/MSYS PATH automatically inherits the Windows PATH
-# REQUIRES: %fish -c "not __fish_is_cygwin"
-
 if command -q getconf
     # (no env -u, some systems don't support that)
     set -l getconf (command -s getconf)

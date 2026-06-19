@@ -537,6 +537,11 @@ pub fn fire_delayed(parser: &mut Parser) {
         return;
     }
 
+    #[cfg(windows)]
+    {
+        let _ = posix_signal::dispatch();
+    }
+
     // We unfortunately can't keep this locked until we're done with it because the SIGWINCH handler
     // code might call back into here and we would delay processing of the events, leading to a test
     // failure under CI.

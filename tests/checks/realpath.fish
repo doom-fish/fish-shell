@@ -152,6 +152,8 @@ builtin realpath / /
 # CHECK: /
 
 builtin realpath '' /tmp '' /dont-exist ''
+# CHECKERR: warning: An error occurred while redirecting file '/dev/null'
+# CHECKERR: warning: Path '/dev' does not exist
 # CHECKERR: realpath: Invalid arg:
 # CHECK: {{.*}}/tmp
 # CHECKERR: realpath: Invalid arg:

@@ -18,7 +18,11 @@ function isolated-tmux-start --wraps fish
 
     function isolated-tmux-cleanup --on-event fish_exit --inherit-variable tmpdir
         isolated-tmux kill-server
-        rm -r $tmpdir
+        # On Windows a directory cannot be removed while it is any live process's
+        # working directory; leave $tmpdir first, and tolerate a still-exiting
+        # tmux server briefly holding it (teardown only, not part of the test).
+        cd /
+        rm -r $tmpdir 2>/dev/null
     end
 
     function tmux-sleep

@@ -74,7 +74,7 @@ test -z "$diffs"
 # In cases that look like process substitutions, mention psub.
 
 echo <(seq 0)
-# CHECKERR: {{.*}}/psub.fish (line {{\d+}}): Invalid redirection target:
+# CHECKERR: {{.*}}psub.fish (line {{\d+}}): Invalid redirection target:
 # CHECKERR: echo <(seq 0)
 # CHECKERR:      ^~~~~~~^
 # CHECKERR: If you wish to use process substitution, consider the psub command, see: `help cmds/psub`
@@ -85,7 +85,7 @@ echo <(seq 1)
 # CHECKERR: warning: Path '1' does not exist
 
 echo <(seq 2)
-# CHECKERR: {{.*}}/psub.fish (line {{\d+}}): Invalid redirection target:
+# CHECKERR: {{.*}}psub.fish (line {{\d+}}): Invalid redirection target:
 # CHECKERR: echo <(seq 2)
 # CHECKERR:      ^~~~~~~^
 # CHECKERR: If you wish to use process substitution, consider the psub command, see: `help cmds/psub`

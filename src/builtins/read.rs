@@ -23,7 +23,11 @@ use fish_util::perror;
 use fish_wcstringutil::{split_about, split_string_tok};
 use fish_widestring::bytes2wcstring;
 use libc::SEEK_CUR;
-use std::{num::NonZeroUsize, os::fd::RawFd, sync::atomic::Ordering};
+use std::{num::NonZeroUsize, sync::atomic::Ordering};
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use osfd_win::RawFd;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum TokenOutputMode {

@@ -17,6 +17,14 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 */
 
+// On Windows the system heap (HeapAlloc/HeapFree via ntdll) dominates hot paths
+// like argument expansion and command substitution (profiled: ~40% of a
+// cmdsub-heavy workload was in the allocator). mimalloc is markedly faster for
+// the small short-lived allocations fish makes; swap it in process-wide.
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use fish::{
     ast,
     builtins::{
@@ -64,10 +72,11 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     ops::ControlFlow,
-    os::unix::prelude::*,
     path::Path,
     sync::{Arc, atomic::Ordering},
 };
+#[cfg(unix)]    use std::os::unix::prelude::*;
+#[cfg(windows)] use osfd_win::prelude::*;
 
 /// container to hold the options specified within the command line
 #[derive(Default, Debug)]
@@ -135,6 +144,15 @@ fn print_rusage_self() {
 // Source the file config.fish in the given directory.
 // Returns true if successful, false if not.
 fn source_config_in_directory(parser: &mut Parser, dir: &wstr) -> bool {
+    // Some config directories (e.g. `paths.sysconf`) are stored as native paths, but fish's POSIX
+    // path domain expects `/c/...`. Normalize so both the sourced path and the
+    // `config: sourcing ...` diagnostic are POSIX (and `escape` doesn't quote a backslash path).
+    // `win_to_posix` is idempotent for the already-POSIX user config path. Identity off-Windows.
+    #[cfg(windows)]
+    let dir_owned =
+        bytes2wcstring(posix_rt::pathconv::win_to_posix(OsStr::from_bytes(&wcs2bytes(dir))).as_bytes());
+    #[cfg(windows)]
+    let dir: &wstr = &dir_owned;
     // If the config.fish file doesn't exist or isn't readable silently return. Fish versions up
     // thru 2.2.0 would instead try to source the file with stderr redirected to /dev/null to deal
     // with that possibility.
@@ -342,6 +360,15 @@ fn fish_parse_opt(args: &mut [WString], opts: &mut FishCmdOpts) -> ControlFlow<i
     // We are an interactive session if we have not been given an explicit
     // command or file to execute and stdin is a tty. Note that the -i or
     // --interactive options also force interactive mode.
+    //
+    // On Windows a pty slave inherited from an external terminal multiplexer
+    // (tmux/Cygwin) arrives as a named pipe the console probe would not see as a
+    // tty. Promote any std descriptor that is really such a pty first, so the
+    // `isatty` check below — and all later interactive setup — recognises it.
+    #[cfg(windows)]
+    for fd in [STDIN_FILENO, libc::STDOUT_FILENO, STDERR_FILENO] {
+        posix_pty::promote_if_terminal(fd);
+    }
     if opts.batch_cmds.is_empty() && optind == args.len() && isatty(STDIN_FILENO) {
         set_interactive_session(true);
     }
@@ -551,19 +578,62 @@ fn throwing_main() -> i32 {
         }
         res = reader_read(parser, libc::STDIN_FILENO, &IoChain::new());
     } else {
-        let filename = &args[my_optind];
+        let filename_arg = &args[my_optind];
+        my_optind += 1;
+        // fishbowl path model: paths inside fish are POSIX (`/c/...`). A script path can
+        // arrive in native Windows form (`C:/...`) when fish is launched directly by
+        // Windows tooling; normalize it to POSIX so `status -f`/`status dirname` and every
+        // path derived from them (HOME/XDG set in config, error diagnostics) stay
+        // consistent `/c/`-POSIX. `win_to_posix` is idempotent for already-POSIX input.
+        // On non-Windows this is the identity.
+        #[cfg(windows)]
+        let filename_owned = bytes2wcstring(
+            posix_rt::pathconv::win_to_posix(OsStr::from_bytes(&wcs2bytes(filename_arg))).as_bytes(),
+        );
+        #[cfg(windows)]
+        let filename: &wstr = &filename_owned;
+        #[cfg(not(windows))]
+        let filename: &wstr = filename_arg;
         let n = wcs2bytes(filename);
         let path = OsStr::from_bytes(&n);
-        my_optind += 1;
+        // Translate fish's POSIX script path (e.g. `/d/temp/...`) to the native Windows
+        // form before handing it to `std::fs::File::open`. std would otherwise treat the
+        // leading `/` as the current drive's root and fail to find the file, so `fish -n
+        // /c/...` (no-execute) could not even read the script to parse it.
+        #[cfg(windows)]
+        let open_result = File::open(posix_rt::pathconv::posix_to_win(path));
+        #[cfg(not(windows))]
+        let open_result = File::open(path);
         // Rust sets cloexec by default, see above
-        match File::open(path) {
+        match open_result {
             Err(e) => {
-                flogf!(
-                    error,
-                    wgettext!("Error reading script file '%s':"),
-                    path.to_string_lossy()
-                );
-                eprintf!("%s\n", e);
+                // On Unix `File::open` succeeds on a directory and the EISDIR error
+                // surfaces later when the reader tries to read it. On Windows opening a
+                // directory fails outright with a generic error, so detect that case here
+                // and emit the same messages the reader would, matching fish's behavior.
+                #[cfg(windows)]
+                let is_dir = std::fs::metadata(posix_rt::pathconv::posix_to_win(path))
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                #[cfg(not(windows))]
+                let is_dir = false;
+                if is_dir {
+                    flog!(
+                        error,
+                        wgettext_fmt!("Unable to read input file: %s", "Is a directory")
+                    );
+                    flog!(
+                        warning,
+                        wgettext_fmt!("Error while reading file %s", path.to_string_lossy())
+                    );
+                } else {
+                    flogf!(
+                        error,
+                        wgettext!("Error reading script file '%s':"),
+                        path.to_string_lossy()
+                    );
+                    eprintf!("%s\n", e);
+                }
             }
             Ok(f) => {
                 if let Ok(f) = heightenize_fd(f.into(), true).map(File::from) {

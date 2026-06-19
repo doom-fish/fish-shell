@@ -202,6 +202,15 @@ impl EnvUniversal {
         };
 
         let real_path = wrealpath(&self.vars_path).unwrap_or_else(|| self.vars_path.clone());
+        // fish's internal path model is POSIX (`/c/Users/...`), and `wrealpath` returns that form.
+        // The rewrite helper creates the temporary file and renames it into place using `std::fs`,
+        // which on Windows needs a native path (`C:\Users\...`). Translate at this boundary.
+        // `posix_to_win_str` is idempotent on already-native paths.
+        #[cfg(windows)]
+        let real_path = {
+            let posix_utf8: String = real_path.chars().collect();
+            WString::from_str(&posix_rt::pathconv::posix_to_win_str(&posix_utf8))
+        };
         match rewrite_via_temporary_file(&real_path, rewrite) {
             Ok((file_id, potential_update)) => {
                 self.last_read_file_id = file_id;

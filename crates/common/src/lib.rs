@@ -6,17 +6,21 @@ use fish_widestring::{
     PROCESS_EXPAND_SELF_STR, UCS2_MAX, VARIABLE_EXPAND, VARIABLE_EXPAND_SINGLE, WExt as _, WString,
     bytes2wcstring, decode_byte_from_char, fish_reserved_codepoint, wcs2bytes, wstr,
 };
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+#[cfg(windows)]
+use osfd_win::{AsRawFd, BorrowedFd, RawFd};
 use libc::{SIG_IGN, SIGTTOU, STDIN_FILENO};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(windows)]
+use osfd_win::ffi::OsStrExt as _;
 use std::{
     cell::{Cell, RefCell},
     env,
     io::Read,
     mem,
     ops::{Deref, DerefMut},
-    os::{
-        fd::{AsRawFd, BorrowedFd, RawFd},
-        unix::ffi::OsStrExt as _,
-    },
     rc::Rc,
     sync::{
         Arc, LazyLock,
@@ -1023,7 +1027,7 @@ pub fn is_console_session() -> bool {
     static IS_CONSOLE_SESSION: LazyLock<bool> = LazyLock::new(||
         // No console session on Apple, and ttyname may hang (#12506).
         !cfg!(apple)
-            && nix::unistd::ttyname(unsafe { std::os::fd::BorrowedFd::borrow_raw(STDIN_FILENO) })
+            && nix::unistd::ttyname(unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) })
                 .is_ok_and(|buf| {
                     // Check if the tty matches /dev/(console|dcons|tty[uv\d])
                     let is_console_tty = match buf.as_os_str().as_bytes() {

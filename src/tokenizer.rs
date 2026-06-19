@@ -11,7 +11,10 @@ use fish_feature_flags::{FeatureFlag, feature_test};
 use libc::{STDIN_FILENO, STDOUT_FILENO};
 use nix::fcntl::OFlag;
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not, Range};
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(windows)]
+use osfd_win::RawFd;
 
 /// Token types. XXX Why this isn't ParseTokenType, I'm not really sure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

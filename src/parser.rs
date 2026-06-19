@@ -40,7 +40,10 @@ use std::fs::File;
 use std::io::Write as _;
 use std::num::NonZeroU32;
 use std::ops::DerefMut;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(windows)]
+use osfd_win::OwnedFd;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1120,7 +1123,14 @@ impl Parser {
     pub fn flush_profiling(&mut self, path: &OsStr) {
         // Save profiling information. OK to not use CLOEXEC here because this is called while fish is
         // exiting (and hence will not fork).
-        let mut f = match std::fs::File::create(path) {
+        // The path comes from the command line in fish's POSIX view (e.g. `/c/Users/...`); translate
+        // it to the OS-native form before handing it to std::fs at the boundary, otherwise
+        // File::create fails on Windows (Cygwin/MSYS2 path model).
+        #[cfg(windows)]
+        let create_result = std::fs::File::create(posix_rt::pathconv::posix_to_win(path));
+        #[cfg(not(windows))]
+        let create_result = std::fs::File::create(path);
+        let mut f = match create_result {
             Ok(f) => f,
             Err(err) => {
                 flog!(
@@ -1294,7 +1304,20 @@ impl Parser {
 
 // Given a file path, return something nicer. Currently we just "unexpand" tildes.
 fn user_presentable_path(path: &wstr, vars: &dyn Environment) -> WString {
-    replace_home_directory_with_tilde(path, vars)
+    let presentable = replace_home_directory_with_tilde(path, vars);
+    // On Windows the script/source path arrives with backslash separators (and
+    // possibly a drive letter). fish's diagnostics — and the tests that assert
+    // on them — use POSIX-style forward slashes, so normalize for display.
+    #[cfg(windows)]
+    {
+        let normalized: WString = presentable
+            .chars()
+            .map(|c| if c == '\\' { '/' } else { c })
+            .collect();
+        return normalized;
+    }
+    #[cfg(not(windows))]
+    presentable
 }
 
 /// Print profiling information to the specified stream.

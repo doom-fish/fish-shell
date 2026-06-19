@@ -74,7 +74,10 @@ def extract_sections(app, env):
             f"Unsupported characters in section path: {section}"
         )
     help_sections = "".join(f"{section}\n" for section in sections)
-    Path(output_file).write_text(help_sections)
+    # Force LF: Path.write_text uses text mode, which would translate \n to \r\n on
+    # Windows, making the generated file differ from the LF-committed
+    # share/help_sections on every line.
+    Path(output_file).write_text(help_sections, newline="\n")
 
 
 def remove_fish_indent_lexer(app):
@@ -118,9 +121,16 @@ author = "fish-shell developers"
 issue_url = "https://github.com/fish-shell/fish-shell/issues"
 
 # From Cargo, or no build system.
-ret = subprocess.check_output(
-    ("../build_tools/git_version_gen.sh"), stderr=subprocess.STDOUT
-).decode("utf-8")
+# git_version_gen.sh is a POSIX shell script; on Windows it cannot be executed
+# directly (CreateProcess rejects a non-PE file with WinError 193), so invoke it
+# through `sh`. The version is incidental to the man pages, so fall back to a
+# placeholder rather than failing the whole build if the probe does not succeed.
+_version_script = "../build_tools/git_version_gen.sh"
+_version_cmd = ["sh", _version_script] if sys.platform == "win32" else (_version_script,)
+try:
+    ret = subprocess.check_output(_version_cmd, stderr=subprocess.STDOUT).decode("utf-8")
+except (OSError, subprocess.CalledProcessError):
+    ret = "fish, version 0.0.0"
 
 # The full version, including alpha/beta/rc tags
 release = ret.strip().split(" ")[-1]
@@ -257,6 +267,10 @@ man_pages = [
 ]
 for path in sorted(set(glob("cmds/*.rst")) - set(glob(fish_exclude_patterns))):
     docname = os.path.splitext(path)[0]
+    # Sphinx document names are always forward-slash separated; on Windows glob()
+    # yields backslashes, so normalise or the man_pages entries reference unknown
+    # documents (e.g. `cmds\abbr` instead of `cmds/abbr`).
+    docname = docname.replace(os.sep, "/")
     cmd = os.path.basename(docname)
     man_pages.append((docname, cmd, get_command_description(path, cmd), "", 1))
 

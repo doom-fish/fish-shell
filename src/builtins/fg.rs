@@ -10,7 +10,10 @@ use crate::{err_fmt, err_str};
 use fish_util::perror;
 use libc::STDIN_FILENO;
 use nix::sys::termios::{self, tcsetattr};
+#[cfg(unix)]
 use std::os::fd::BorrowedFd;
+#[cfg(windows)]
+use osfd_win::BorrowedFd;
 
 use super::prelude::*;
 

@@ -98,12 +98,19 @@ function __fish_tmux_parse_lscm_usage
     end
 end
 
-__fish_tmux_parse_lscm_usage
-functions -e __fish_tmux_parse_lscm_usage
+# Only generate the dynamic completions when a tmux server is already known to be
+# running (i.e. we are inside a tmux session). Querying `tmux list-commands`
+# otherwise spawns a server as a side effect of sourcing this file; on Windows
+# that spawned server can inherit and hold the command-substitution pipe, which
+# hangs the shell until the leaked server exits.
+if set -q TMUX
+    __fish_tmux_parse_lscm_usage
 
-# Completions for `tmux list-commands` itself
-set -l all_commands (tmux list-commands -F "#{command_list_name} #{command_list_alias}" 2>/dev/null)
-and complete -c tmux -n "__fish_seen_subcommand_from list-commands lscm" -x -a "$all_commands"
+    # Completions for `tmux list-commands` itself
+    set -l all_commands (tmux list-commands -F "#{command_list_name} #{command_list_alias}" 2>/dev/null)
+    and complete -c tmux -n "__fish_seen_subcommand_from list-commands lscm" -x -a "$all_commands"
+end
+functions -e __fish_tmux_parse_lscm_usage
 
 ###############  End:   Dynamic Completions Using `tmux list-commands` ###############
 

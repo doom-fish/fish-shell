@@ -3,7 +3,10 @@
 #[cfg(test)]
 mod tests {
     use std::fs::File;
+    #[cfg(unix)]
     use std::os::fd::AsRawFd as _;
+    #[cfg(windows)]
+    use osfd_win::AsRawFd as _;
 
     #[test]
     fn test_fd_cloexec() {

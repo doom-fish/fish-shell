@@ -105,7 +105,7 @@ $helper print_fds 20</dev/null
 # reserved for the user
 set -l tmpfile (mktemp)
 printf 'stdout: %s\n' "$($fish -c "$helper print_fds 3>&1 4>&1 5>&1 6>&1 7>&1 8>&1 9>&1 >$tmpfile")"
-printf "tmp file: %s\n" $(cat $tmpfile)
+printf "tmp file: %s\n" (string collect < $tmpfile)
 # CHECK: stdout:
 # CHECK: tmp file: 0 1 2 3 4 5 6 7 8 9
 

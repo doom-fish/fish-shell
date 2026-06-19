@@ -1,5 +1,10 @@
 use libc::c_int;
+#[cfg(unix)]
 use std::os::unix::prelude::*;
+#[cfg(windows)]
+use osfd_win::prelude::*;
+#[cfg(windows)]
+use osfd_win::RawFd;
 use std::time::Duration;
 
 #[derive(Clone, Copy)]

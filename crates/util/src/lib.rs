@@ -7,9 +7,12 @@ use std::{
     cmp::Ordering,
     ffi::CStr,
     io::Write as _,
-    os::fd::{BorrowedFd, RawFd},
     time,
 };
+#[cfg(unix)]
+use std::os::fd::{BorrowedFd, RawFd};
+#[cfg(windows)]
+use osfd_win::{BorrowedFd, RawFd};
 
 /// Compares two wide character strings with an (arguably) intuitive ordering. This function tries
 /// to order strings in a way which is intuitive to humans with regards to sorting strings

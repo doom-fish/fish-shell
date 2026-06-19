@@ -2,11 +2,11 @@
 # Test that using variables as command names work correctly.
 
 $EMPTY_VARIABLE
-#CHECKERR: {{.*}}checks/vars_as_commands.fish (line {{\d+}}): The expanded command was empty.
+#CHECKERR: {{.*}}vars_as_commands.fish (line {{\d+}}): The expanded command was empty.
 #CHECKERR: $EMPTY_VARIABLE
 #CHECKERR: ^~~~~~~~~~~~~~^
 "$EMPTY_VARIABLE"
-#CHECKERR: {{.*}}checks/vars_as_commands.fish (line {{\d+}}): The expanded command was empty.
+#CHECKERR: {{.*}}vars_as_commands.fish (line {{\d+}}): The expanded command was empty.
 #CHECKERR: "$EMPTY_VARIABLE"
 #CHECKERR: ^~~~~~~~~~~~~~~~^
 
@@ -48,7 +48,7 @@ echo 'set -l status_cmd true; if $status_cmd; echo Heck yes this is true; end' |
 #CHECK: Heck yes this is true
 
 foo=bar $NONEXISTENT -c 'set foo 1 2 3; set --show foo'
-#CHECKERR: {{.*}}checks/vars_as_commands.fish (line {{\d+}}): The expanded command was empty.
+#CHECKERR: {{.*}}vars_as_commands.fish (line {{\d+}}): The expanded command was empty.
 #CHECKERR: foo=bar $NONEXISTENT -c 'set foo 1 2 3; set --show foo'
 #CHECKERR:         ^~~~~~~~~~~^
 

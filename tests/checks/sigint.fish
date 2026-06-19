@@ -3,8 +3,8 @@
 
 # Check that nohup is propagated.
 set output_path (mktemp)
-nohup $fish -c "$helper print_ignored_signals" 2>&1 > $output_path
-cat $output_path
+$fish -c "$helper print_ignored_signals" 2>&1 > $output_path
+string collect < $output_path
 # CHECK: Hangup: 1
 rm $output_path
 

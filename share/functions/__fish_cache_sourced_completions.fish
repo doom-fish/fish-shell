@@ -41,7 +41,10 @@ function __fish_cache_sourced_completions
     end
 
     if path is -rf -- $compfile
-        source $compfile
+        # Some commands (notably on Windows) emit their completion script with
+        # CRLF line endings. A stray CR breaks fish's backslash line-continuations
+        # when the file is sourced, so strip it before sourcing.
+        string replace -a -- \r '' <$compfile | source
         return 0
     end
     return 3

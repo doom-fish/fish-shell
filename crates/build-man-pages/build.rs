@@ -48,11 +48,14 @@ fn build_man(sec1_dir: &Path) {
         return;
     }
 
+    // Whether the user explicitly demanded docs (`FISH_BUILD_DOCS=1`). If so, a failure to build
+    // them is fatal; otherwise we degrade gracefully: emit a cargo `warning:` and continue so a
+    // plain `cargo build --bin fish` still succeeds even when the man build errors (e.g. a Sphinx
+    // toolchain problem on a developer's machine). The man pages are nice-to-have for `--help`, but
+    // forcing every build to set `FISH_BUILD_DOCS=0` to work around a broken doc build is worse.
+    let docs_required = env_var("FISH_BUILD_DOCS") == Some("1".to_owned());
+
     // We run sphinx to build the man pages.
-    // Every error here is fatal so cargo doesn't cache the result
-    // - if we skipped the docs with sphinx not installed, installing it would not then build the docs.
-    // That means you need to explicitly set $FISH_BUILD_DOCS=0 (`FISH_BUILD_DOCS=0 cargo install --path .`),
-    // which is unfortunate - but the docs are pretty important because they're also used for --help.
     let sphinx_build = match Command::new(option_env!("FISH_SPHINX").unwrap_or("sphinx-build"))
         .args(args)
         .stdout(Stdio::piped())
@@ -74,16 +77,32 @@ fn build_man(sec1_dir: &Path) {
             return;
         }
         Err(e) => {
-            // Another error - permissions wrong etc
-            panic!("Error starting sphinx-build to build man pages: {:?}", e);
+            // Another error - permissions wrong etc. Don't abort the whole build over a doc
+            // toolchain problem unless docs were explicitly requested.
+            if docs_required {
+                panic!("Error starting sphinx-build to build man pages: {:?}", e);
+            }
+            rsconf::warn!(
+                "Could not start sphinx-build to build man pages ({:?}). \
+                 Skipping man pages; set $FISH_BUILD_DOCS=1 to make this fatal.",
+                e
+            );
+            return;
         }
         Ok(sphinx_build) => sphinx_build,
     };
 
     match sphinx_build.wait_with_output() {
         Err(err) => {
-            panic!(
-                "Error waiting for sphinx-build to build man pages: {:?}",
+            if docs_required {
+                panic!(
+                    "Error waiting for sphinx-build to build man pages: {:?}",
+                    err
+                );
+            }
+            rsconf::warn!(
+                "Error waiting for sphinx-build to build man pages ({:?}). \
+                 Skipping man pages; set $FISH_BUILD_DOCS=1 to make this fatal.",
                 err
             );
         }
@@ -91,11 +110,24 @@ fn build_man(sec1_dir: &Path) {
             if !out.stderr.is_empty() {
                 rsconf::warn!("sphinx-build: {}", String::from_utf8_lossy(&out.stderr));
             }
-            assert_eq!(&String::from_utf8_lossy(&out.stdout), "");
-            assert!(
-                out.status.success(),
-                "sphinx-build failed to build the man pages."
-            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if !out.status.success() || !stdout.is_empty() {
+                // The man build failed. Fatal only if docs were explicitly requested; otherwise
+                // warn and continue so an ordinary build still succeeds.
+                if docs_required {
+                    if !stdout.is_empty() {
+                        rsconf::warn!("sphinx-build (stdout): {}", stdout);
+                    }
+                    panic!("sphinx-build failed to build the man pages.");
+                }
+                if !stdout.is_empty() {
+                    rsconf::warn!("sphinx-build (stdout): {}", stdout);
+                }
+                rsconf::warn!(
+                    "sphinx-build failed to build the man pages. \
+                     Skipping man pages; set $FISH_BUILD_DOCS=1 to make this fatal."
+                );
+            }
         }
     }
 }

@@ -18,9 +18,12 @@ use nix::{fcntl::OFlag, sys::stat::Mode};
 use std::{
     fs::File,
     io,
-    os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd},
-    sync::{Arc, LazyLock, Mutex, MutexGuard},
+    sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock},
 };
+#[cfg(unix)]
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
+#[cfg(windows)]
+use osfd_win::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 
 /// separated_buffer_t represents a buffer of output from commands, prepared to be turned into a
 /// variable. For example, command substitutions output into one of these. Most commands just
@@ -303,13 +306,25 @@ impl IoData for IoPipe {
 pub struct IoBufferfill {
     target: RawFd,
 
-    /// Write end. The other end is connected to an IoBuffer.
-    write_fd: OwnedFd,
-
-    /// The receiving buffer.
+    /// The receiving buffer. Builtins — the common command-substitution case — append
+    /// to this directly (see `create_output_stream_for_builtin`); the OS pipe below is
+    /// only created when an *external* process needs a real fd to write to.
     buffer: IoBuffer,
 
-    /// The id of the item in the fd monitor, used to stop the background fillthread operation.
+    /// The OS pipe + background fill thread, created lazily on the first `source_fd()`
+    /// (i.e. when an external process is about to be wired up). For an all-builtin
+    /// command substitution this stays uninitialized, avoiding a per-`(...)`
+    /// `CreateNamedPipeW` + FdMonitor handoff + close. `Some(None)` means a needed pipe
+    /// could not be created.
+    pipe: OnceLock<Option<BufferfillPipe>>,
+}
+
+/// The lazily-created OS pipe backing an [`IoBufferfill`] when an external process
+/// writes to it. Absent for all-builtin command substitutions.
+struct BufferfillPipe {
+    /// Write end; external processes dup2 this onto their stdout.
+    write_fd: OwnedFd,
+    /// The id of the fill-thread item in the fd monitor, used to stop it.
     item_id: FdMonitorItemId,
 }
 impl IoBufferfill {
@@ -324,29 +339,46 @@ impl IoBufferfill {
     /// \param target the fd which this will be dup2'd to - typically stdout.
     pub fn create_opts(buffer_limit: usize, target: RawFd) -> io::Result<Arc<Self>> {
         assert!(target >= 0, "Invalid target fd");
-
-        // Construct our pipes.
-        let pipes = make_autoclose_pipes()?;
-        // Our buffer will read from the read end of the pipe. This end must be non-blocking. This is
-        // because our fillthread needs to poll to decide if it should shut down, and also accept input
-        // from direct buffer transfers.
-        match make_fd_nonblocking(pipes.read.as_raw_fd()) {
-            Ok(_) => (),
-            Err(e) => {
-                flog!(warning, PIPE_ERROR);
-                perror_io("fcntl", &e);
-                return Err(e);
-            }
-        }
-        // Our fillthread gets the read end of the pipe. Our returned Bufferfill gets the write end.
-        let buffer = IoBuffer::new(buffer_limit);
-        let item_id = begin_filling(buffer.clone(), pipes.read);
+        // The OS pipe is created lazily (see `pipe()`): a command substitution whose
+        // output comes only from builtins never creates one, which avoids a
+        // CreateNamedPipeW + FdMonitor handoff + close on every `(...)`.
         Ok(Arc::new(Self {
             target,
-            write_fd: pipes.write,
-            buffer,
-            item_id,
+            buffer: IoBuffer::new(buffer_limit),
+            pipe: OnceLock::new(),
         }))
+    }
+
+    /// Lazily create (once) the OS pipe and its background fill thread, the first time
+    /// an external process needs a real fd to write to. Returns `None` if pipe
+    /// creation failed (e.g. too many open fds); callers treat that as an invalid fd.
+    fn pipe(&self) -> Option<&BufferfillPipe> {
+        self.pipe
+            .get_or_init(|| {
+                // Construct our pipes. The read end must be non-blocking so the
+                // fillthread can poll to decide when to shut down and accept direct
+                // buffer transfers.
+                let pipes = match make_autoclose_pipes() {
+                    Ok(pipes) => pipes,
+                    Err(e) => {
+                        flog!(warning, PIPE_ERROR);
+                        perror_io("pipe", &io::Error::from(e));
+                        return None;
+                    }
+                };
+                if let Err(e) = make_fd_nonblocking(pipes.read.as_raw_fd()) {
+                    flog!(warning, PIPE_ERROR);
+                    perror_io("fcntl", &e);
+                    return None;
+                }
+                // Our fillthread gets the read end; we keep the write end.
+                let item_id = begin_filling(self.buffer.clone(), pipes.read);
+                Some(BufferfillPipe {
+                    write_fd: pipes.write,
+                    item_id,
+                })
+            })
+            .as_ref()
     }
 
     pub fn buffer(&self) -> &IoBuffer {
@@ -354,16 +386,22 @@ impl IoBufferfill {
     }
 
     pub fn read_all_available(&self) {
-        fd_monitor().with_fd(self.item_id, |fd| self.buffer.read_all_available(fd));
+        // Only meaningful when an external process forced an OS pipe into existence.
+        if let Some(pipe) = self.pipe.get().and_then(Option::as_ref) {
+            fd_monitor().with_fd(pipe.item_id, |fd| self.buffer.read_all_available(fd));
+        }
     }
 
     /// Reset the receiver (possibly closing the write end of the pipe), and complete the fillthread
     /// of the buffer. Return the buffer.
     pub fn finish(filler: Arc<Self>) -> SeparatedBuffer {
-        // The io filler is passed in. This typically holds the only instance of the write side of the
-        // pipe used by the buffer's fillthread (except for that side held by other processes).
-        // Then allow the buffer to finish.
-        let fd = fd_monitor().remove_item(filler.item_id);
+        // If an external process forced an OS pipe, stop its fillthread and drain the
+        // read end. Otherwise the buffer was filled directly by builtins and there is
+        // nothing to drain.
+        let fd = match filler.pipe.get().and_then(Option::as_ref) {
+            Some(pipe) => fd_monitor().remove_item(pipe.item_id),
+            None => None,
+        };
         filler.buffer.complete_and_take_buffer(fd)
     }
 }
@@ -375,12 +413,16 @@ impl IoData for IoBufferfill {
         self.target
     }
     fn source_fd(&self) -> RawFd {
-        self.write_fd.as_raw_fd()
+        // Wiring up an external process forces the OS pipe to exist.
+        self.pipe().map_or(-1, |p| p.write_fd.as_raw_fd())
     }
     fn print(&self) {
         eprintf!(
             "bufferfill %d -> %d\n",
-            self.write_fd.as_raw_fd(),
+            self.pipe
+                .get()
+                .and_then(Option::as_ref)
+                .map_or(-1, |p| p.write_fd.as_raw_fd()),
             self.fd()
         );
     }
@@ -533,6 +575,27 @@ impl IoChain {
         self.0.iter().rev().find(|data| data.fd() == fd).cloned()
     }
 
+    /// Resolve which underlying source fd a given target fd currently refers to, given the
+    /// redirections already present in this chain. This walks the chain backwards, following
+    /// dup-style redirections (e.g. fd 1 -> pipe write end) so that an `fd` redirection such as
+    /// `2>&1` can be pointed directly at the resolved source fd. Returns a negative value if the
+    /// target fd has been closed in this chain.
+    fn resolve_source_fd(&self, target: RawFd) -> RawFd {
+        let mut cursor = target;
+        if cursor < 0 {
+            return cursor;
+        }
+        for io in self.0.iter().rev() {
+            if io.fd() == cursor {
+                cursor = io.source_fd();
+                if cursor < 0 {
+                    break;
+                }
+            }
+        }
+        cursor
+    }
+
     /// Attempt to resolve a list of redirection specs to IOs, appending to 'this'.
     /// Return true on success, false on error, in which case an error will have been printed.
     #[allow(clippy::collapsible_else_if)]
@@ -545,10 +608,27 @@ impl IoChain {
             // find the first problematic component for a better message.
             if [ENOENT, ENOTDIR].contains(&err) {
                 flogf!(warning, FILE_ERROR, target);
+                // On Windows a bare path component may name a `.exe` image
+                // (`/bin/sh` refers to `sh.exe`, the Cygwin/MSYS convention), so
+                // when diagnosing which component is at fault, treat such a path as
+                // the non-directory file it refers to rather than "does not exist".
+                let stat_component = |p: &wstr| {
+                    wstat(p).or_else(|e| {
+                        #[cfg(windows)]
+                        {
+                            let mut exe = p.to_owned();
+                            exe.push_utfstr(L!(".exe"));
+                            if let Ok(md) = wstat(&exe) {
+                                return Ok(md);
+                            }
+                        }
+                        Err(e)
+                    })
+                };
                 let mut dname: &wstr = target;
                 while !dname.is_empty() {
                     let next: &wstr = wdirname(dname);
-                    if let Ok(md) = wstat(next) {
+                    if let Ok(md) = stat_component(next) {
                         if !md.is_dir() {
                             flogf!(warning, "Path '%s' is not a directory", next);
                         } else {
@@ -563,6 +643,11 @@ impl IoChain {
                 // That's expected (ctrl-c on the commandline),
                 // so no warning.
                 flogf!(warning, FILE_ERROR, target);
+                // `flogf!` (and any logging it performs) can overwrite the global
+                // errno, but `perror` reads it — restore the open() errno captured
+                // by the caller so the message is correct (e.g. "Is a directory"
+                // for EISDIR instead of a stale "Unknown error").
+                errno::set_errno(Errno(err));
                 perror("open");
             }
         };
@@ -576,13 +661,30 @@ impl IoChain {
                         let target_fd = spec
                             .get_target_as_fd()
                             .expect("fd redirection should have been validated already");
-                        self.push(Arc::new(IoFd::new(spec.fd, target_fd)));
+                        // Resolve the target fd against redirections already established in this
+                        // chain. For example in `cmd 2>&1 | ...` the chain already contains the
+                        // pipe (fd 1 -> pipe write end), so `2>&1` must point stderr directly at
+                        // the pipe's underlying fd. Relying on a later dup2(1, 2) to chain off the
+                        // remapped fd 1 is not portable: our Windows posix_spawn shim applies fd
+                        // actions without chaining, which would otherwise leave stderr attached to
+                        // the original stdout (see redirect.fish `&|`/`|&`/`2>&1 |`).
+                        let source_fd = self.resolve_source_fd(target_fd);
+                        if source_fd < 0 {
+                            // The target fd is closed in this chain, so closing is the result.
+                            self.push(Arc::new(IoClose::new(spec.fd)));
+                        } else {
+                            self.push(Arc::new(IoFd::new(spec.fd, source_fd)));
+                        }
                     }
                 }
                 _ => {
                     // We have a path-based redirection. Resolve it to a file.
                     // Mark it as CLOEXEC because we don't want it to be open in any child.
-                    let path = path_apply_working_directory(&spec.target, pwd);
+                    // Native Windows targets (`C:/foo`, `\\server\share`) are translated into
+                    // fish's POSIX view first; otherwise the drive-qualified form (no leading `/`)
+                    // is misread as relative to `$PWD` (Cygwin/MSYS2 model).
+                    let target = crate::wutil::native_input_to_posix(&spec.target);
+                    let path = path_apply_working_directory(&target, pwd);
                     let oflags = spec.oflags();
 
                     match wopen_cloexec(&path, oflags, OPEN_MASK) {

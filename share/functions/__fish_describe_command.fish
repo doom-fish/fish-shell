@@ -22,8 +22,8 @@ function __fish_describe_command -d "Command used to find descriptions for comma
         split($1, names, ", ");
         for (name in names)
             if (names[name] ~ /^'"$argv_regex"'.* *\([18]\)/ ) {
-                sub( "( |\t)*\\\([18]\\\)", "", names[name] );
-                sub( " \\\[.*\\\]", "", names[name] );
+                sub( "( |\t)*\\([18]\\)", "", names[name] );
+                sub( " \\[.*\\]", "", names[name] );
                 print names[name] "\t" $2;
             }
     }'

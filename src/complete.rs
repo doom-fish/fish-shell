@@ -32,7 +32,7 @@ use fish_common::{ScopeGuard, UnescapeFlags, UnescapeStringStyle, escape, unesca
 use fish_util::wcsfilecmp;
 use fish_wcstringutil::{
     StringFuzzyMatch, string_fuzzy_match_string, string_prefixes_string,
-    string_suffixes_string_case_insensitive, strip_executable_suffix,
+    string_suffixes_string_case_insensitive,
 };
 use fish_widestring::{WExt as _, charptr2wcstring};
 use std::{
@@ -46,6 +46,23 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+/// Session cache for command-completion descriptions (`complete_cmd_desc`).
+///
+/// Spawning the `apropos`/`whatis` lookup (`__fish_describe_command`) is a
+/// process launch that, on native Windows, pays MSYS process-init overhead on
+/// every completion redraw. The result depends only on the typed prefix and the
+/// definition of `__fish_describe_command`, so it is safe to memoise as long as
+/// that function is unchanged. The key therefore pairs the typed prefix with the
+/// current annotated definition of `__fish_describe_command`: redefining the
+/// function (as the completion tests do, and as a user could) changes the key and
+/// bypasses stale entries, while the stable real-world case turns the dominant
+/// cost of command-name completion into a map clone. (A manpage installed
+/// mid-session is not reflected until the entry is evicted — acceptable for
+/// cosmetic descriptions.)
+#[allow(clippy::type_complexity)]
+static CMD_DESC_CACHE: LazyLock<Mutex<HashMap<(WString, WString), BTreeMap<WString, WString>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Completion description strings, mostly for different types of files, such as sockets, block
 // devices, etc.
@@ -1005,78 +1022,108 @@ impl<'ctx, 'parser> Completer<'ctx, 'parser> {
         // the missing part of the extension (`xe`)
         let no_exe = strip_partial_executable_suffix(cmd);
 
-        // First locate a list of possible descriptions using a single call to apropos or a direct
-        // search if we know the location of the whatis database. This can take some time on slower
-        // systems with a large set of manuals, but it should be ok since apropos is only called once.
-        // For Cygwin, also try to find the exact match for the non-exe name
-        let lookup_cmd = sprintf!(
-            "functions -q __fish_describe_command &&{ __fish_describe_command -- %s %s}",
-            &escape(cmd),
-            &no_exe
-                .map(|(cmd_sans_exe, _)| {
-                    sprintf!(
-                        "; __fish_describe_command --exact -- %s",
-                        escape(cmd_sans_exe)
-                    )
-                })
-                .unwrap_or_default()[..]
-        );
+        // Memoise the apropos/whatis lookup (see `CMD_DESC_CACHE`). The cache key
+        // pairs the typed prefix with the actual current `__fish_describe_command`
+        // definition, so a redefinition (or absence) of that function correctly
+        // bypasses any stale entry. Pointer identity is not enough here because a
+        // redefined function may reuse the same allocation address.
+        let desc_fn_def = function::get_props(L!("__fish_describe_command"))
+            .map(|p| p.annotated_definition(L!("__fish_describe_command")))
+            .unwrap_or_default();
+        let cache_key = (desc_fn_def, cmd.to_owned());
+        let cached = CMD_DESC_CACHE.lock().unwrap().get(&cache_key).cloned();
 
-        let mut list = vec![];
-        let _ = exec_subshell(
-            &lookup_cmd,
-            parser,
-            Some(&mut list),
-            false, /* don't apply exit status */
-        );
+        let lookup: BTreeMap<WString, WString> = match cached {
+            Some(hit) => hit,
+            None => {
+                // First locate a list of possible descriptions using a single call to apropos or a
+                // direct search if we know the location of the whatis database. This can take some
+                // time on slower systems with a large set of manuals, but it should be ok since
+                // apropos is only called once. For Cygwin, also try to find the exact match for the
+                // non-exe name. Redirect the lookup's stderr to /dev/null: description lookup is
+                // best-effort and its backends (apropos, and the awk that parses their output) may
+                // emit diagnostics — e.g. some awk builds warn about redundant regex escapes — which
+                // must not leak into completion output.
+                let lookup_cmd = sprintf!(
+                    "functions -q __fish_describe_command &&{ __fish_describe_command -- %s %s} 2>/dev/null",
+                    &escape(cmd),
+                    &no_exe
+                        .map(|(cmd_sans_exe, _)| {
+                            sprintf!(
+                                "; __fish_describe_command --exact -- %s",
+                                escape(cmd_sans_exe)
+                            )
+                        })
+                        .unwrap_or_default()[..]
+                );
 
-        // Then discard anything that is not a possible completion and put the result into a
-        // hashtable with the completion as key and the description as value.
-        let mut lookup = BTreeMap::new();
-        // A typical entry is the command name, followed by a tab, followed by a description.
-        for elstr in &mut list {
-            // Skip cases without a tab, or without a description
-            // Bizarre cases where the tab is part of the command will be filtered later.
-            let Some(tab_idx) = elstr.find_char('\t') else {
-                continue;
-            };
-            if tab_idx + 1 >= elstr.len() {
-                continue;
+                let mut list = vec![];
+                let _ = exec_subshell(
+                    &lookup_cmd,
+                    parser,
+                    Some(&mut list),
+                    false, /* don't apply exit status */
+                );
+
+                // Then discard anything that is not a possible completion and put the result into a
+                // map with the completion suffix as key and the description as value.
+                let mut lookup = BTreeMap::new();
+                // A typical entry is the command name, followed by a tab, followed by a description.
+                for elstr in &mut list {
+                    // Skip cases without a tab, or without a description.
+                    // Bizarre cases where the tab is part of the command will be filtered later.
+                    let Some(tab_idx) = elstr.find_char('\t') else {
+                        continue;
+                    };
+                    if tab_idx + 1 >= elstr.len() {
+                        continue;
+                    }
+
+                    // Make the set components. This is the stuff after the command.
+                    // For example:
+                    //  elstr = lsmod\ta description
+                    //  cmd = ls
+                    //  key = mod
+                    //  val = A description
+                    // Note an empty key is common and natural, if 'cmd' were already valid.
+                    let parts = elstr.as_mut_utfstr().split_at_mut(tab_idx);
+                    let key = if parts.0.len() >= cmd.len() {
+                        &parts.0[cmd.len()..]
+                    } else if let Some((_, comp)) = no_exe.filter(|(stripped, _)| stripped == parts.0)
+                    {
+                        // On Cygwin, `cmd` might be `lsmod.e`, then key needs to be `xe`, while
+                        // elstr is `lsmod\t...` (i.e. parts.0 is `lsmod`)
+                        comp
+                    } else {
+                        continue;
+                    };
+                    let val = &mut parts.1[1..];
+
+                    // And once again I make sure the first character is uppercased because I like it
+                    // that way, and I get to decide these things.
+                    let mut upper_chars = val.chars().next().unwrap().to_uppercase();
+                    if let (Some(c), None) = (upper_chars.next(), upper_chars.next()) {
+                        val.as_char_slice_mut()[0] = c;
+                    }
+                    lookup.insert(key.to_owned(), val.to_owned());
+                }
+
+                // Bound the cache so a long session completing many distinct prefixes (or churning
+                // the describe function) cannot grow it without limit.
+                let mut cache = CMD_DESC_CACHE.lock().unwrap();
+                if cache.len() >= 1024 {
+                    cache.clear();
+                }
+                cache.insert(cache_key, lookup.clone());
+                lookup
             }
-
-            // Make the set components. This is the stuff after the command.
-            // For example:
-            //  elstr = lsmod\ta description
-            //  cmd = ls
-            //  key = mod
-            //  val = A description
-            // Note an empty key is common and natural, if 'cmd' were already valid.
-            let parts = elstr.as_mut_utfstr().split_at_mut(tab_idx);
-            let key = if parts.0.len() >= cmd.len() {
-                &parts.0[cmd.len()..]
-            } else if let Some((_, comp)) = no_exe.filter(|(stripped, _)| stripped == parts.0) {
-                // On Cygwin, `cmd` might be `lsmod.e`, then key needs to be `xe`, while
-                // elstr is `lsmod\t...` (i.e. parts.0 is `lsmod`)
-                comp
-            } else {
-                continue;
-            };
-            let val = &mut parts.1[1..];
-
-            // And once again I make sure the first character is uppercased because I like it that
-            // way, and I get to decide these things.
-            let mut upper_chars = val.chars().next().unwrap().to_uppercase();
-            if let (Some(c), None) = (upper_chars.next(), upper_chars.next()) {
-                val.as_char_slice_mut()[0] = c;
-            }
-            lookup.insert(key, &*val);
-        }
+        };
 
         // Then do a lookup on every completion and if a match is found, change to the new
         // description.
         for completion in self.completions.as_list_mut() {
             let el = &completion.completion;
-            if let Some(&desc) = lookup.get(el.as_utfstr()) {
+            if let Some(desc) = lookup.get(el.as_utfstr()) {
                 completion.description = desc.to_owned();
             }
         }
@@ -1292,7 +1339,7 @@ impl<'ctx, 'parser> Completer<'ctx, 'parser> {
                         // On cygwin, if we didn't have a completion for "foo.exe",
                         // check if there is one for "foo"
                         !idx.is_path
-                            && strip_executable_suffix(r#match)
+                            && strip_dot_exe_suffix(r#match)
                                 .is_some_and(|stripped| wildcard_match(stripped, &idx.name, false))
                     );
                 if has_match {
@@ -1800,7 +1847,7 @@ impl<'ctx, 'parser> Completer<'ctx, 'parser> {
             // since every app is sandboxed and can't access each other.
             return false;
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(not(target_os = "android"), not(windows)))]
         {
             static SETPWENT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1867,6 +1914,48 @@ impl<'ctx, 'parser> Completer<'ctx, 'parser> {
             unsafe { libc::endpwent() };
 
             result
+        }
+
+        #[cfg(windows)]
+        {
+            // There is no POSIX passwd database to enumerate here. The Windows runtime models a
+            // single POSIX user: the current Windows user, resolved from real Win32 state
+            // (GetUserNameW) via `nix::unistd::User`. Complete `~NAME` against that one user.
+            use nix::unistd::{Uid, User};
+
+            if s.char_at(0) != '~' || s.contains('/') {
+                return false;
+            }
+            let user_name = s.slice_from(1);
+            if user_name.contains('~') {
+                return false;
+            }
+            let name_len = s.len() - 1;
+
+            let Ok(Some(userinfo)) = User::from_uid(Uid::current()) else {
+                return false;
+            };
+            let pw_name = WString::from_str(&userinfo.name);
+
+            let Some(r#match) = StringFuzzyMatch::try_create(user_name, &pw_name, true) else {
+                return false;
+            };
+            let desc = wgettext_fmt!(COMPLETE_USER_DESC, &pw_name);
+            let mut flags = CompleteFlags::NO_SPACE;
+            if r#match.requires_full_replacement() {
+                flags |= CompleteFlags::DONT_ESCAPE;
+            }
+            let _ = self.completions.add(Completion::new(
+                if r#match.requires_full_replacement() {
+                    sprintf!("~%s", &pw_name)
+                } else {
+                    pw_name.slice_from(name_len).to_owned()
+                },
+                desc,
+                r#match,
+                flags,
+            ));
+            true
         }
     }
 
@@ -2439,11 +2528,20 @@ fn completion2string(index: &CompletionEntryIndex, o: &CompleteEntryOpt) -> WStr
     out
 }
 
+/// Remove the optional `.exe` executable extension if there is one.
+/// Like [`fish_wcstringutil::strip_executable_suffix`] but also active on native Windows, where the
+/// `cygwin` cfg is not set yet `.exe` is still the executable extension.
+fn strip_dot_exe_suffix(path: &wstr) -> Option<&wstr> {
+    const DOT_EXE: &wstr = L!(".exe");
+    ((cfg!(cygwin) || cfg!(windows)) && string_suffixes_string_case_insensitive(DOT_EXE, path))
+        .then(|| &path[..path.len() - DOT_EXE.len()])
+}
+
 /// If the cmd contains a partial executable extension, return the stripped
 /// command and missing part of the full extension.
 /// E.g. `cmd.e` -> `Some(("cmd", "xe"))``
 fn strip_partial_executable_suffix(cmd: &wstr) -> Option<(&wstr, &wstr)> {
-    if !cfg!(cygwin) {
+    if !(cfg!(cygwin) || cfg!(windows)) {
         return None;
     }
 
@@ -2493,8 +2591,8 @@ pub fn complete_load(cmd: &wstr, parser: &mut Parser) -> bool {
             loaded_new = true;
         }
         AutoloadResult::None => {
-            // On Cygwin, if we failed to find a completion for "foo.exe", try "foo"
-            if let Some(stripped) = strip_executable_suffix(cmd) {
+            // On Cygwin/Windows, if we failed to find a completion for "foo.exe", try "foo"
+            if let Some(stripped) = strip_dot_exe_suffix(cmd) {
                 loaded_new = complete_load(stripped, parser);
             }
         }
@@ -3300,10 +3398,13 @@ mod tests {
         // the target, which will fail with recursive symlinks
         #[cfg(not(cygwin))]
         {
+            #[cfg(unix)]
+            use std::os::unix::fs::symlink;
+            #[cfg(windows)]
+            use osfd_win::fs::symlink;
             std::fs::create_dir_all("test/autosuggest_test/has_loop/loopy").unwrap();
             let _ = std::fs::remove_file("test/autosuggest_test/has_loop/loopy/loop");
-            std::os::unix::fs::symlink("../loopy", "test/autosuggest_test/has_loop/loopy/loop")
-                .unwrap();
+            symlink("../loopy", "test/autosuggest_test/has_loop/loopy/loop").unwrap();
         }
 
         let wd = "test/autosuggest_test";

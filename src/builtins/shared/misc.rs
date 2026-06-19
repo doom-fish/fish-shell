@@ -125,6 +125,10 @@ const BUILTIN_DATAS: &[BuiltinData] = &[
         func: gettext::gettext,
     },
     BuiltinData {
+        name: L!("__fish_render_man"),
+        func: render_man::render_man,
+    },
+    BuiltinData {
         name: L!("abbr"),
         func: abbr::abbr,
     },
@@ -269,8 +273,20 @@ const BUILTIN_DATAS: &[BuiltinData] = &[
         func: jobs::jobs,
     },
     BuiltinData {
+        name: L!("kill"),
+        func: kill::kill,
+    },
+    BuiltinData {
         name: L!("math"),
         func: math::math,
+    },
+    BuiltinData {
+        name: L!("mkdir"),
+        func: mkdir::mkdir,
+    },
+    BuiltinData {
+        name: L!("mktemp"),
+        func: mktemp::mktemp,
     },
     BuiltinData {
         name: L!("not"),
@@ -309,12 +325,24 @@ const BUILTIN_DATAS: &[BuiltinData] = &[
         func: r#return::r#return,
     },
     BuiltinData {
+        name: L!("rm"),
+        func: rm::rm,
+    },
+    BuiltinData {
+        name: L!("seq"),
+        func: seq::seq,
+    },
+    BuiltinData {
         name: L!("set"),
         func: set::set,
     },
     BuiltinData {
         name: L!("set_color"),
         func: set_color::set_color,
+    },
+    BuiltinData {
+        name: L!("sleep"),
+        func: sleep::sleep,
     },
     BuiltinData {
         name: L!("source"),
@@ -339,6 +367,10 @@ const BUILTIN_DATAS: &[BuiltinData] = &[
     BuiltinData {
         name: L!("time"),
         func: builtin_generic,
+    },
+    BuiltinData {
+        name: L!("touch"),
+        func: touch::touch,
     },
     BuiltinData {
         name: L!("true"),

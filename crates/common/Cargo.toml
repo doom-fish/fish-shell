@@ -19,3 +19,7 @@ rsconf.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.dependencies]
+osfd-win = { path = "../../../../crates/osfd-win" }
+

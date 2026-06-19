@@ -3,21 +3,21 @@
 
 string
 # CHECKERR: string: missing subcommand
-# CHECKERR: {{.*}}checks/string.fish (line {{\d+}}):
+# CHECKERR: {{.*}}string.fish (line {{\d+}}):
 # CHECKERR: string
 # CHECKERR: ^
 # CHECKERR: (Type 'help string' for related documentation)
 
 string abc
 # CHECKERR: string abc: invalid subcommand
-# CHECKERR: {{.*}}checks/string.fish (line {{\d+}}):
+# CHECKERR: {{.*}}string.fish (line {{\d+}}):
 # CHECKERR: string abc
 # CHECKERR: ^
 # CHECKERR: (Type 'help string' for related documentation)
 
 string --abc
 # CHECKERR: string --abc: invalid subcommand
-# CHECKERR: {{.*}}checks/string.fish (line {{\d+}}):
+# CHECKERR: {{.*}}string.fish (line {{\d+}}):
 # CHECKERR: string --abc
 # CHECKERR: ^
 # CHECKERR: (Type 'help string' for related documentation)
@@ -1004,7 +1004,7 @@ echo $status
 function string
     builtin string $argv
 end
-# CHECKERR: {{.*}}checks/string.fish (line {{\d+}}): function: string: cannot use reserved keyword as function name
+# CHECKERR: {{.*}}string.fish (line {{\d+}}): function: string: cannot use reserved keyword as function name
 # CHECKERR: function string
 # CHECKERR: ^~~~~~~~~~~~~~^
 
@@ -1318,7 +1318,7 @@ string replace -r o '${bad_name}' foobar
 
 string match --unknown-opt
 # CHECKERR: string match: --unknown-opt: unknown option
-# CHECKERR: {{.*}}checks/string.fish (line {{\d+}}):
+# CHECKERR: {{.*}}string.fish (line {{\d+}}):
 # CHECKERR: string match --unknown-opt
 # CHECKERR: ^
 # CHECKERR: (Type 'help string' for related documentation)

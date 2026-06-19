@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 members = ["crates/*"]
 
 [workspace.package]
@@ -125,6 +125,7 @@ fish-widestring.workspace = true
 itertools.workspace = true
 libc.workspace = true
 lru.workspace = true
+manfmt = { path = "../../crates/manfmt" }
 macro_rules_attribute = "0.2.2"
 nix.workspace = true
 num-traits.workspace = true
@@ -138,6 +139,21 @@ xterm-color.workspace = true
 portable-atomic.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+mimalloc = "0.1"
+osfd-win = { path = "../../crates/osfd-win" }
+posix-abi = { path = "../../crates/posix-abi" }
+posix-conpty = { path = "../../crates/posix-conpty" }
+posix-pty = { path = "../../crates/posix-pty" }
+posix-signal = { path = "../../crates/posix-signal" }
+posix-rt = { path = "../../crates/posix-rt" }
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+] }
 rust-embed = { workspace = true, features = [
   "deterministic-timestamps",
   "debug-embed",
@@ -180,6 +196,14 @@ path = "src/bin/fish_indent.rs"
 [[bin]]
 name = "fish_key_reader"
 path = "src/bin/fish_key_reader.rs"
+
+[[bin]]
+name = "fish_test_helper"
+path = "src/bin/fish_test_helper.rs"
+
+[[bin]]
+name = "kill"
+path = "src/bin/kill.rs"
 
 [features]
 default = ["embed-manpages", "localize-messages"]
@@ -235,3 +259,9 @@ print_stderr = "deny"
 
 [lints]
 workspace = true
+
+# --- fishbowl native-Windows integration ---
+[patch.crates-io]
+nix = { path = "../../integration/shims/nix" }
+libc = { path = "../../integration/shims/libc" }
+

@@ -42,13 +42,16 @@ use std::{
     fs,
     io::Write as _,
     num::NonZeroU32,
-    os::fd::RawFd,
     rc::Rc,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicU8, Ordering},
     },
 };
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use osfd_win::RawFd;
 
 /// Types of processes.
 #[derive(Default)]
@@ -562,11 +565,33 @@ impl Process {
             self.wait_handle.replace(Some(WaitHandle::new(
                 pid,
                 jid,
-                wbasename(&self.actual_cmd.clone()).to_owned(),
+                wait_handle_base_name(wbasename(&self.actual_cmd.clone())),
             )));
         }
         self.wait_handle()
     }
+}
+
+/// Compute the base name stored in a process's wait handle.
+///
+/// On Windows external commands are resolved to a file that carries an executable
+/// extension (e.g. `true` becomes `true.exe`). POSIX `wait`/`$last_pid`-by-name and the
+/// fish test-suite expect to match the *logical* command name (`wait true`), so we strip a
+/// trailing Windows executable extension here. Names without such an extension are
+/// preserved verbatim (so this is a no-op on non-Windows platforms).
+fn wait_handle_base_name(name: &wstr) -> WString {
+    let mut base = name.to_owned();
+    let chars: Vec<char> = base.chars().collect();
+    if let Some(dot) = chars.iter().rposition(|&c| c == '.') {
+        let ext: String = chars[dot + 1..]
+            .iter()
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if matches!(ext.as_str(), "exe" | "com" | "bat" | "cmd") {
+            base.truncate(dot);
+        }
+    }
+    base
 }
 
 /// A set of jobs properties. These are immutable: they do not change for the lifetime of the

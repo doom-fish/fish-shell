@@ -6,7 +6,11 @@ use libc::{
     EACCES, EIO, ELOOP, ENAMETOOLONG, ENODEV, ENOENT, ENOTDIR, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
     S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
 };
-use std::{cell::Cell, io, mem::MaybeUninit, os::fd::RawFd, ptr::NonNull, rc::Rc};
+use std::{cell::Cell, io, mem::MaybeUninit, ptr::NonNull, rc::Rc};
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use osfd_win::RawFd;
 
 /// Types of files that may be in a directory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -427,7 +431,10 @@ mod tests {
         File::create(makepath(regname)).unwrap();
         #[cfg(not(cygwin))]
         {
+            #[cfg(unix)]
             use std::os::unix::fs::symlink;
+            #[cfg(windows)]
+            use osfd_win::fs::symlink;
 
             symlink(makepath(regname), makepath(reglinkname)).unwrap();
             symlink(makepath(dirname), makepath(dirlinkname)).unwrap();

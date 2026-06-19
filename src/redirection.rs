@@ -4,7 +4,10 @@ use crate::io::IoChain;
 use crate::prelude::*;
 use crate::wutil::fish_wcstoi;
 use nix::fcntl::OFlag;
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(windows)]
+use osfd_win::RawFd;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum RedirectionMode {
