@@ -12,7 +12,7 @@ end
 isolated-tmux-start
 
 isolated-tmux send-keys name Enter 'echo foo' Enter
-tmux-sleep
+sleep-until "isolated-tmux capture-pane -p | string match -q '*prompt 1>*'"
 isolated-tmux capture-pane -p
 # CHECK: read> name
 # CHECK: hello name
@@ -21,9 +21,11 @@ isolated-tmux capture-pane -p
 # CHECK: prompt 1>
 
 isolated-tmux send-keys C-l 'SHELL_WELCOME=hello $fish -ic "read --prompt-str=R"' Enter
-tmux-sleep
+# Wait for the nested fish's read prompt (a line starting with "R") before
+# interrupting, so Ctrl-C reaches the read rather than racing its startup.
+sleep-until "isolated-tmux capture-pane -p | string match -q 'R*'"
 isolated-tmux send-keys C-c
-tmux-sleep
+sleep-until "isolated-tmux capture-pane -p | string match -q '*prompt 2>*'"
 isolated-tmux capture-pane -p
 # CHECK: prompt 1> SHELL_WELCOME=hello $fish -ic "read --prompt-str=R"
 # CHECK: R
