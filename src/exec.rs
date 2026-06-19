@@ -477,8 +477,11 @@ fn launch_process_nofork(vars: &EnvStack, p: &Process) -> ! {
 // we use fork(), we can call tcsetpgrp after the fork, before the exec, and avoid the race).
 #[cfg(have_posix_spawn)]
 fn can_use_posix_spawn_for_job(job: &Job, dup2s: &Dup2List) -> bool {
-    // Is it globally disabled?
-    if !use_posix_spawn() {
+    // Is it globally disabled? On Windows there is no fork() to fall back to, so
+    // posix_spawn (CreateProcessW) must be used for every job regardless of the
+    // `fish_use_posix_spawn` preference — selecting fork there would just fail
+    // with ENOSYS.
+    if !use_posix_spawn() && !cfg!(windows) {
         return false;
     }
 
