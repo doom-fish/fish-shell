@@ -113,7 +113,9 @@ use crate::{
 #[cfg(not(windows))]
 use crate::wutil::fstat;
 use assert_matches::assert_matches;
-use errno::{Errno, errno};
+use errno::errno;
+#[cfg(not(windows))]
+use errno::Errno;
 use fish_common::{
     EscapeFlags, EscapeStringStyle, ScopeGuard, escape, escape_string, escape_string_with_quote,
     exit_without_destructors, get_obfuscation_read_char, help_section,
@@ -129,9 +131,11 @@ use fish_wcstringutil::{
 };
 use fish_widestring::{ELLIPSIS_CHAR, UTF8_BOM_WCHAR, bytes2wcstring};
 use libc::{
-    _POSIX_VDISABLE, EIO, EISDIR, ENOTTY, ESRCH, O_NONBLOCK, O_RDONLY, SIGINT, STDERR_FILENO,
+    _POSIX_VDISABLE, EIO, ENOTTY, ESRCH, O_NONBLOCK, O_RDONLY, SIGINT, STDERR_FILENO,
     STDIN_FILENO, STDOUT_FILENO, VMIN, VQUIT, VSUSP, VTIME, c_char,
 };
+#[cfg(not(windows))]
+use libc::EISDIR;
 use nix::{
     fcntl::OFlag,
     sys::{

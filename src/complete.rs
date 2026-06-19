@@ -34,7 +34,9 @@ use fish_wcstringutil::{
     StringFuzzyMatch, string_fuzzy_match_string, string_prefixes_string,
     string_suffixes_string_case_insensitive,
 };
-use fish_widestring::{WExt as _, charptr2wcstring};
+use fish_widestring::WExt as _;
+#[cfg(not(windows))]
+use fish_widestring::charptr2wcstring;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -44,8 +46,9 @@ use std::{
         LazyLock, Mutex, MutexGuard,
         atomic::{self, AtomicUsize},
     },
-    time::{Duration, Instant},
 };
+#[cfg(not(windows))]
+use std::time::{Duration, Instant};
 
 /// Session cache for command-completion descriptions (`complete_cmd_desc`).
 ///

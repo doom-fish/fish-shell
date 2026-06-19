@@ -14,7 +14,7 @@ pub use wcstoi::{
     fish_wcstoi, fish_wcstol, fish_wcstol_radix, fish_wcstoul, wcstoi, wcstoi_opts, wcstoi_partial,
 };
 
-use crate::{fds::BorrowedFdFile, flog, signal::SigChecker};
+use crate::{fds::BorrowedFdFile, signal::SigChecker};
 use errno::{Errno, set_errno};
 use fish_util::{perror, write_to_fd};
 use fish_wcstringutil::join_strings;

@@ -17,8 +17,6 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use osfd_win::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::prelude::*;
-#[cfg(windows)]
-use osfd_win::prelude::*;
 
 localizable_consts!(
     pub PIPE_ERROR

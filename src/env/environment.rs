@@ -31,10 +31,9 @@ use fish_common::{UnescapeStringStyle, unescape_string};
 use fish_wcstringutil::join_strings;
 use fish_widestring::{cstr2wcstring, osstr2wcstring, str2wcstring, wcs2osstring};
 use libc::c_int;
-use nix::{
-    NixPath as _,
-    unistd::{Uid, User, gethostname, getpid},
-};
+#[cfg(not(windows))]
+use nix::NixPath as _;
+use nix::unistd::{Uid, User, gethostname, getpid};
 use std::{
     collections::HashMap,
     ffi::CStr,

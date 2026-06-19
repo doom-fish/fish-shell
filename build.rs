@@ -3,6 +3,7 @@ use fish_build_helper::{
     workspace_root,
 };
 use rsconf::Target;
+#[cfg(not(windows))]
 use std::path::{Path, PathBuf};
 
 fn main() {
